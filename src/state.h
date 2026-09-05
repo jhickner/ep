@@ -6,10 +6,13 @@
  *
  * One line per book, most recently read first:
  *
- *     spine <tab> block <tab> when <tab> page <tab> total <tab> mode <tab> path
+ *     spine <tab> block <tab> when <tab> page <tab> total <tab> mode <tab>
+ *     off <tab> path
  *
- * `spine`/`block` are the reading position and are exact; `page`/`total` are
- * the printed-page estimate shown in the status line and by --resume.
+ * `spine`/`block`/`off` are the reading position and are exact; `off` is a
+ * byte offset into the block, so the place survives a change of column width.
+ * `page`/`total` are the printed-page estimate shown in the status line and
+ * by --resume. Lines written before `off` existed simply parse without it.
  */
 
 #include <limits.h>
@@ -19,7 +22,7 @@
 #define STATE_LINES 400
 
 typedef struct {
-    int         spine, block, page, total, mode;
+    int         spine, block, off, page, total, mode;
     time_t      when;
     const char *path;    /* into the line parsed, so it does not outlive it */
 } StateLine;
@@ -27,12 +30,12 @@ typedef struct {
 typedef struct {
     char   path[PATH_MAX];
     char   title[400];
-    int    spine, block, page, total, mode;
+    int    spine, block, off, page, total, mode;
     time_t when;
 } RecentBook;
 
 bool state_lookup(const char *path, StateLine *out);
-void state_save(const char *path, int spine, int block, int page, int total, int mode);
+void state_save(const char *path, int spine, int block, int off, int page, int total, int mode);
 void state_forget(const char *path);
 int  state_recent(RecentBook *out, int cap);
 void state_dir(char *out, size_t n);
@@ -67,10 +70,10 @@ static bool state_parse(char *line, StateLine *out) {
     char *nl = strchr(line, '\n');
     if (nl) *nl = '\0';
 
-    long long num[6] = { 0, 0, 0, 0, 0, 0 };
+    long long num[7] = { 0, 0, 0, 0, 0, 0, 0 };
     int nnum = 0;
     char *p = line;
-    while (nnum < 6) {
+    while (nnum < 7) {
         char *tab = strchr(p, '\t');
         if (!tab || tab == p) break;
         bool digits = true;
@@ -89,6 +92,7 @@ static bool state_parse(char *line, StateLine *out) {
     out->page  = nnum > 3 ? (int)num[3] : 0;
     out->total = nnum > 4 ? (int)num[4] : 0;
     out->mode  = nnum > 5 ? (int)num[5] : 0;
+    out->off   = nnum > 6 ? (int)num[6] : 0;
     out->path  = p;
     return true;
 }
@@ -117,7 +121,7 @@ bool state_lookup(const char *path, StateLine *out) {
 
 /* Rewrites the store with `path` at the head, or without it when `spine` is
    negative. Every other line is carried over as it was. */
-static void state_put(const char *path, int spine, int block, int page, int total, int mode) {
+static void state_put(const char *path, int spine, int block, int off, int page, int total, int mode) {
     char sp[PATH_MAX], dir[PATH_MAX];
     state_path(sp, sizeof sp);
     state_dir(dir, sizeof dir);
@@ -136,9 +140,9 @@ static void state_put(const char *path, int spine, int block, int page, int tota
             StateLine sl;
             if (!state_parse(copy, &sl)) continue;
             if (!strcmp(sl.path, path)) continue;      /* superseded, or dropped */
-            snprintf(keep[nkeep++], sizeof keep[0], "%d\t%d\t%lld\t%d\t%d\t%d\t%s",
+            snprintf(keep[nkeep++], sizeof keep[0], "%d\t%d\t%lld\t%d\t%d\t%d\t%d\t%s",
                      sl.spine, sl.block, (long long)sl.when, sl.page, sl.total,
-                     sl.mode, sl.path);
+                     sl.mode, sl.off, sl.path);
         }
         fclose(f);
     }
@@ -164,8 +168,8 @@ static void state_put(const char *path, int spine, int block, int page, int tota
     FILE *o = fopen(tmp, "w");
     if (o) {
         if (spine >= 0)
-            fprintf(o, "%d\t%d\t%lld\t%d\t%d\t%d\t%s\n",
-                    spine, block, (long long)time(NULL), page, total, mode, path);
+            fprintf(o, "%d\t%d\t%lld\t%d\t%d\t%d\t%d\t%s\n",
+                    spine, block, (long long)time(NULL), page, total, mode, off, path);
         for (int i = 0; i < nkeep; i++) fprintf(o, "%s\n", keep[i]);
         fclose(o);
         rename(tmp, sp);
@@ -173,12 +177,12 @@ static void state_put(const char *path, int spine, int block, int page, int tota
     free(keep);
 }
 
-void state_save(const char *path, int spine, int block, int page, int total, int mode) {
-    state_put(path, spine, block, page, total, mode);
+void state_save(const char *path, int spine, int block, int off, int page, int total, int mode) {
+    state_put(path, spine, block, off, page, total, mode);
 }
 
 void state_forget(const char *path) {
-    state_put(path, -1, 0, 0, 0, 0);
+    state_put(path, -1, 0, 0, 0, 0, 0);
 }
 
 /* Newest first. Books whose file has since gone are left out. */
@@ -200,6 +204,7 @@ int state_recent(RecentBook *out, int cap) {
         snprintf(b->path, sizeof b->path, "%s", sl.path);
         b->spine = sl.spine;
         b->block = sl.block;
+        b->off   = sl.off;
         b->page  = sl.page;
         b->total = sl.total;
         b->mode  = sl.mode;

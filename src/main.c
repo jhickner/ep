@@ -134,15 +134,41 @@ static int page_at(const Reader *r, int block) {
     return chars / CHARS_PER_PAGE + 1;
 }
 
+/* The first line at or below `from` that comes from a real block; blank
+   spacers carry no position of their own. */
+static int first_real_line(const Reader *r, int from) {
+    for (int i = from < 0 ? 0 : from; i < r->lay.n; i++)
+        if (r->lay.lines[i].block >= 0) return i;
+    return -1;
+}
+
+/* Byte offset of a line's text within its block. Wrapping changes which
+   offsets start a line, but not the offsets themselves, so this is the part
+   of the position that survives a change of column width. */
+static int line_off(const Reader *r, const Line *ln) {
+    if (ln->block < 0 || ln->type != BLK_TEXT || !ln->text) return 0;
+    const Block *b = &r->doc.blocks[ln->block];
+    if (!b->text || ln->text < b->text || ln->text > b->text + b->len) return 0;
+    return (int)(ln->text - b->text);
+}
+
+/* Where the top of the window sits, as a (block, offset) pair. */
+static void top_pos(const Reader *r, int *block, int *off) {
+    int i = first_real_line(r, r->top);
+    if (i < 0) { *block = 0; *off = 0; return; }
+    *block = r->lay.lines[i].block;
+    *off   = line_off(r, &r->lay.lines[i]);
+}
+
 static int top_block(const Reader *r) {
-    if (r->top < r->lay.n && r->lay.lines[r->top].block >= 0)
-        return r->lay.lines[r->top].block;
-    return 0;
+    int i = first_real_line(r, r->top);
+    return i < 0 ? 0 : r->lay.lines[i].block;
 }
 
 static void progress_save(Reader *r) {
-    int block = top_block(r);
-    state_save(r->path, r->spine, block, page_at(r, block), page_total(r), 0);
+    int block, off;
+    top_pos(r, &block, &off);
+    state_save(r->path, r->spine, block, off, page_at(r, block), page_total(r), 0);
 }
 
 /* ---------------------------------------------------------------- images -- */
@@ -313,7 +339,7 @@ static int page_of(const Reader *r, int line) {
     return p;
 }
 
-static void relayout(Reader *r, int keep_block) {
+static void relayout(Reader *r, int keep_block, int keep_off) {
     layout_free(&r->lay);
     places_clear(r);
     r->cols = r->width;
@@ -322,16 +348,21 @@ static void relayout(Reader *r, int keep_block) {
     r->lay = layout_doc(&r->doc, r->cols, img_rows, r);
     repaginate(r);
     r->top = 0;
-    if (keep_block > 0) {
-        for (int i = 0; i < r->lay.n; i++)
-            if (r->lay.lines[i].block == keep_block) { r->top = i; break; }
+    if (keep_block > 0 || keep_off > 0) {
+        /* The last line of the block that starts at or before the saved
+           offset - that is the line the offset falls on at this width. */
+        for (int i = 0; i < r->lay.n; i++) {
+            if (r->lay.lines[i].block != keep_block) continue;
+            if (line_off(r, &r->lay.lines[i]) > keep_off) break;
+            r->top = i;
+        }
     }
     /* Reading always starts at the top of a page, so a resumed or jumped-to
        position never opens mid-page. */
     r->top = r->pg[page_of(r, r->top)];
 }
 
-static void load_chapter(Reader *r, int spine, int block) {
+static void load_chapter(Reader *r, int spine, int block, int off) {
     if (spine < 0) spine = 0;
     if (spine >= r->book.nspine) spine = r->book.nspine - 1;
     r->spine = spine;
@@ -349,7 +380,14 @@ static void load_chapter(Reader *r, int spine, int block) {
         r->doc = doc_parse(xhtml, base);
         free(xhtml);
     }
-    relayout(r, block);
+    relayout(r, block, off);
+}
+
+/* Re-wrap at the current width, holding the reader's place. */
+static void relayout_keeping(Reader *r) {
+    int block, off;
+    top_pos(r, &block, &off);
+    relayout(r, block, off);
 }
 
 static const char *chapter_title(Reader *r) {
@@ -495,13 +533,13 @@ static void scroll_by(Reader *r, int delta, int page_h) {
     while (top >= r->lay.n) {                 /* run on into later chapters */
         if (r->spine >= r->book.nspine - 1) { top = r->lay.n - 1; break; }
         int over = top - r->lay.n;
-        load_chapter(r, r->spine + 1, 0);
+        load_chapter(r, r->spine + 1, 0, 0);
         top = over;
     }
     while (top < 0) {                         /* and back into earlier ones */
         if (r->spine <= 0) { top = 0; break; }
         int under = -top;
-        load_chapter(r, r->spine - 1, 0);
+        load_chapter(r, r->spine - 1, 0, 0);
         top = r->lay.n - under;
     }
 
@@ -517,13 +555,13 @@ static void turn_page(Reader *r, int dir) {
     int p = page_of(r, r->top);
     if (dir > 0) {
         if (p + 1 < r->npg) { r->top = r->pg[p + 1]; return; }
-        if (r->spine < r->book.nspine - 1) { load_chapter(r, r->spine + 1, 0); r->top = 0; }
+        if (r->spine < r->book.nspine - 1) { load_chapter(r, r->spine + 1, 0, 0); r->top = 0; }
         return;
     }
     if (r->top > r->pg[p]) { r->top = r->pg[p]; return; }   /* nudged off-grid */
     if (p > 0) { r->top = r->pg[p - 1]; return; }
     if (r->spine > 0) {
-        load_chapter(r, r->spine - 1, 0);
+        load_chapter(r, r->spine - 1, 0, 0);
         r->top = r->pg[r->npg - 1];
     }
 }
@@ -537,7 +575,7 @@ static void goto_toc(Reader *r, int idx) {
             if (strcmp(r->book.spine[i], t->href) == 0) { spine = i; break; }
     }
     if (spine < 0) return;
-    load_chapter(r, spine, 0);
+    load_chapter(r, spine, 0, 0);
     if (t->anchor) {
         int block = doc_anchor_block(&r->doc, t->anchor);
         if (block >= 0)
@@ -749,7 +787,7 @@ static int dump(Reader *r) {
     printf("%d chapters, %d toc entries, cover: %s\n\n",
            r->book.nspine, r->book.ntoc, r->book.cover ? r->book.cover : "(none)");
     for (int i = 0; i < r->book.nspine; i++) {
-        load_chapter(r, i, 0);
+        load_chapter(r, i, 0, 0);
         printf("\n===== [%d] %s (%s) =====\n\n", i + 1, chapter_title(r), r->book.spine[i]);
         for (int j = 0; j < r->lay.n; j++) {
             Line *ln = &r->lay.lines[j];
@@ -868,9 +906,11 @@ static int read_epub(const char *path, int width) {
     }
     measure_book(&r);
 
-    int spine = 0, block = 0;
+    int spine = 0, block = 0, off = 0;
     StateLine saved;
-    if (state_lookup(r.path, &saved)) { spine = saved.spine; block = saved.block; }
+    if (state_lookup(r.path, &saved)) {
+        spine = saved.spine; block = saved.block; off = saved.off;
+    }
 
     Screen scr;
     if (!ui_start(&scr)) { epub_close(&r.book); return 1; }
@@ -878,7 +918,7 @@ static int read_epub(const char *path, int width) {
     r.term = &g_tm;
 
     r.page_h = s->height - 1;
-    load_chapter(&r, spine, block);
+    load_chapter(&r, spine, block, off);
 
     bool running = true, help = false, dirty = true;
     while (running) {
@@ -923,8 +963,7 @@ static int read_epub(const char *path, int width) {
             if (g_graphics && term_cell_size(&g_tm, &cw, &ch) && cw > 1 && ch > 1) {
                 g_cell_w = cw; g_cell_h = ch;
             }
-            int keep = r.top < r.lay.n ? r.lay.lines[r.top].block : 0;
-            relayout(&r, keep);
+            relayout_keeping(&r);
             dirty = true;
             continue;
         }
@@ -973,8 +1012,8 @@ static int read_epub(const char *path, int width) {
                     case 'k': scroll_by(&r, -1, page_h); break;
                     case 'd': scroll_by(&r, page_h / 2, page_h); break;
                     case 'u': scroll_by(&r, -page_h / 2, page_h); break;
-                    case 'n': case ']': load_chapter(&r, r.spine + 1, 0); break;
-                    case 'p': case '[': load_chapter(&r, r.spine - 1, 0); break;
+                    case 'n': case ']': load_chapter(&r, r.spine + 1, 0, 0); break;
+                    case 'p': case '[': load_chapter(&r, r.spine - 1, 0, 0); break;
                     case 'g': r.top = 0; break;
                     case 'G': r.top = r.pg[r.npg - 1]; break;
                     case 't': case 'c':
@@ -985,12 +1024,10 @@ static int read_epub(const char *path, int width) {
                         break;
                     case '?': help = true; break;
                     case '-': case '_':
-                        if (r.width > 30) { r.width -= 4;
-                            relayout(&r, r.top < r.lay.n ? r.lay.lines[r.top].block : 0); }
+                        if (r.width > 30) { r.width -= 4; relayout_keeping(&r); }
                         break;
                     case '+': case '=':
-                        if (r.width < 200) { r.width += 4;
-                            relayout(&r, r.top < r.lay.n ? r.lay.lines[r.top].block : 0); }
+                        if (r.width < 200) { r.width += 4; relayout_keeping(&r); }
                         break;
                     default: break;
                 }
@@ -1307,7 +1344,7 @@ static int read_pdf(const char *path) {
         dirty = true;
     }
 
-    state_save(path, page, scroll, page + 1, npages, fit == FIT_WIDTH);
+    state_save(path, page, scroll, 0, page + 1, npages, fit == FIT_WIDTH);
     ui_stop(s);
     pdf_close(doc);
     return 0;
