@@ -526,20 +526,34 @@ static const char *HELP[] = {
     "  g / G              chapter start / end",
     "  t                  table of contents",
     "  - / +              narrower / wider column",
+    "  s                  status line",
     "  T                  typeset pages",
     "  q                  quit (position is saved)",
 };
 
-static void draw_help(Screen *s) {
-    int n = (int)(sizeof HELP / sizeof *HELP);
-    int w = 40, h = n + 2;
+/* Wide enough for its longest line, measured in columns rather than bytes so
+   the arrows in it are not counted twice. */
+static void draw_key_help(Screen *s, const char **rows, int n) {
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        int cw = u8_cols(rows[i], (int)strlen(rows[i]));
+        if (cw > w) w = cw;
+    }
+    w += 2;
+    int h = n + 2;
+    if (w > s->width || h > s->height) return;
+
     int x0 = (s->width - w) / 2, y0 = (s->height - h) / 2;
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
             screen_put(s, x0 + x, y0 + y, ' ', C_FG, C_SEL);
     screen_print(s, x0 + 2, y0, " Keys ", C_ACC, C_SEL);
     for (int i = 0; i < n; i++)
-        screen_print(s, x0 + 1, y0 + 1 + i, HELP[i], C_FG, C_SEL);
+        screen_print(s, x0 + 1, y0 + 1 + i, rows[i], C_FG, C_SEL);
+}
+
+static void draw_help(Screen *s) {
+    draw_key_help(s, HELP, (int)(sizeof HELP / sizeof *HELP));
 }
 
 /* ---------------------------------------------------------------- input -- */
@@ -986,8 +1000,9 @@ static int read_epub(const char *path, int width) {
     load_chapter(&r, spine, block, off);
 
     bool running = true, help = false, dirty = true, switched = false;
+    bool footer = true;
     while (running) {
-        int page_h = s->height - 1;
+        int page_h = s->height - (footer ? 1 : 0);
         if (page_h < 1) page_h = 1;
         r.page_h = page_h;
 
@@ -1006,7 +1021,7 @@ static int read_epub(const char *path, int width) {
 
             for (int y = 0; r.top + y < end; y++)
                 draw_line(&r, s, x0, y, &r.lay.lines[r.top + y], col);
-            draw_status(&r, s);
+            if (footer) draw_status(&r, s);
             if (r.toc_open) draw_toc(&r, s);
             if (help) draw_help(s);
             if (g_graphics) kg_placeholder_redraw_begin();
@@ -1023,7 +1038,8 @@ static int read_epub(const char *path, int width) {
         if (ev.code == KEY_RESIZE) {
             term_get_size(&g_tm);
             screen_resize(s, g_tm.width, g_tm.height);
-            r.page_h = s->height - 1 > 0 ? s->height - 1 : 1;
+            r.page_h = s->height - (footer ? 1 : 0);
+            if (r.page_h < 1) r.page_h = 1;
             int cw, ch;
             if (g_graphics && term_cell_size(&g_tm, &cw, &ch) && cw > 1 && ch > 1) {
                 g_cell_w = cw; g_cell_h = ch;
@@ -1071,6 +1087,7 @@ static int read_epub(const char *path, int width) {
             case KEY_CHAR:
                 switch (ev.ch) {
                     case 'q': running = false; break;
+                    case 's': footer = !footer; break;
                     case 'T':
                         if (type_available() && g_graphics) {
                             switched = true;
@@ -1152,6 +1169,7 @@ typedef struct {
     const char  *font;
     char         initials[PATH_MAX];   /* per-letter fonts for sunk capitals */
     bool         paper;       /* paint a page rather than sit on the terminal */
+    bool         footer;      /* keep a status line at the foot */
     bool         fill;        /* fill the pane rather than hold a page shape */
 
     /* What the terminal said about its own colours. The background is only
@@ -1192,6 +1210,7 @@ static void ty_conf_load(Ty *t) {
         else if (!strcmp(line, "hyphenate")) t->st.hyphenation = atoi(sp) ? 1 : 0;
         else if (!strcmp(line, "dropcap")) t->st.dropcap = atoi(sp) != 0;
         else if (!strcmp(line, "smallcaps")) t->st.smallcaps = atoi(sp) != 0;
+        else if (!strcmp(line, "footer")) t->footer = atoi(sp) != 0;
         else if (!strcmp(line, "leading") && atof(sp) >= 1) t->st.leading = atof(sp);
         else if (!strcmp(line, "measure") && atof(sp) >= 12) t->st.measure = atof(sp);
         else if (!strcmp(line, "columns")) t->st.columns = atoi(sp);
@@ -1207,10 +1226,11 @@ static void ty_conf_save(const Ty *t) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "size %.1f\nleading %.2f\nmeasure %.0f\ncolumns %d\npaper %d\n"
-               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nsmallcaps %d\n",
+               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nsmallcaps %d\n"
+               "footer %d\n",
             t->st.size, t->st.leading, t->st.measure, t->st.columns, t->paper,
             t->fill, t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
-            t->st.dropcap, t->st.smallcaps);
+            t->st.dropcap, t->st.smallcaps, t->footer);
     fclose(f);
 }
 
@@ -1326,25 +1346,19 @@ static void draw_ty_help(Screen *s) {
         "  b / left            previous page",
         "  n p  or  ] [        next / previous chapter",
         "  + -                 larger / smaller type",
-        "  d                   painted page / terminal colours",
-        "  C                   sunk capital at a chapter's opening",
         "  { }                 tighter / looser line spacing",
-        "  T                   wrapped text instead",
-        "  1 2 3               columns;  0 fits as many as will read well",
+        "  1 2 3               columns; 0 fits what reads well",
         "  m M                 narrower / wider column",
         "  w                   fill the pane",
+        "  d                   painted page / terminal colours",
+        "  C                   sunk capital",
         "  J                   justified text",
         "  H                   hyphenation",
+        "  s                   status line",
+        "  T                   wrapped text instead",
         "  q                   quit",
     };
-    int n = (int)(sizeof rows / sizeof rows[0]);
-    int w = 40, h = n + 2;
-    int x0 = (s->width - w) / 2, y0 = (s->height - h) / 2;
-    if (x0 < 0 || y0 < 0) return;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            screen_put(s, x0 + x, y0 + y, ' ', C_FG, C_SEL);
-    for (int i = 0; i < n; i++) screen_print(s, x0, y0 + 1 + i, rows[i], C_FG, C_SEL);
+    draw_key_help(s, rows, (int)(sizeof rows / sizeof rows[0]));
 }
 
 static int read_typeset(const char *path) {
@@ -1370,6 +1384,7 @@ static int read_typeset(const char *path) {
 
     Ty t = {0};
     t.bk = &bk;
+    t.footer = true;
     t.bg_known = g_bg_known;
     t.fg_known = g_fg_known;
     t.bg_light = g_bg_light;
@@ -1402,7 +1417,8 @@ static int read_typeset(const char *path) {
     bool opened = false, switched = false;
 
     while (running) {
-        int box_cols = s->width, box_rows = s->height - 1;
+        /* Without a status line the page has the window to itself. */
+        int box_cols = s->width, box_rows = s->height - (t.footer ? 1 : 0);
 
         if (dirty && box_cols >= 8 && box_rows >= 4) {
             /* A page shaped like a page: the column is sized off the window's
@@ -1449,7 +1465,7 @@ static int read_typeset(const char *path) {
                 for (int rr = 0; rr < rows; rr++)
                     for (int cc = 0; cc < cols; cc++)
                         screen_set(s, x0 + cc, rr, glyph_placeholder(id, rr, cc));
-            draw_ty_status(s, &t);
+            if (t.footer) draw_ty_status(s, &t);
             if (help) draw_ty_help(s);
 
             kg_placeholder_redraw_begin();
@@ -1487,6 +1503,7 @@ static int read_typeset(const char *path) {
                 switch (ev.ch) {
                     case 'q': running = false; break;
                     case 'T': switched = true; running = false; break;
+                    case 's': t.footer = !t.footer; dirty = true; break;
                     case 'f': case 'j': fwd = true; break;
                     case 'b': case 'k': back = true; break;
                     case 'g': t.page = 0; dirty = true; break;
