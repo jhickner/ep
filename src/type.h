@@ -27,11 +27,16 @@
 typedef struct {
     const char *family;      /* serif text face; NULL for the default */
     double      size;        /* body size in pixels */
-    double      leading;     /* line height as a multiple of the body size */
+    double      leading;     /* line height as a multiple of the type size,
+                                the way CSS line-height means it */
     double      margin;      /* page margin in pixels */
     double      indent;      /* paragraph indent in ems, 0 for none */
+    double      measure;     /* widest a column may be, in ems; 0 for no limit */
+    int         columns;     /* 0 to fit as many as the measure allows, else 1-3 */
     double      hyphenation; /* 0 off, 1 hyphenate freely */
     bool        justify;
+    bool        dropcap;     /* sink the chapter's opening letter */
+    const char *initials;    /* directory of per-letter initial fonts, or NULL */
     bool        smooth;      /* subpixel antialiasing */
     bool        transparent; /* leave the paper clear, ignoring paper[] */
     uint8_t     paper[3], ink[3];
@@ -75,11 +80,14 @@ void type_style_default(TypeStyle *st) {
     memset(st, 0, sizeof *st);
     st->family      = "Iowan Old Style";
     st->size        = 17;
-    st->leading     = 1.38;
+    st->leading     = 1.32;
     st->margin      = 28;
     st->indent      = 1.4;
+    st->measure     = 34;    /* about 70 characters of a serif face */
+    st->columns     = 0;
     st->hyphenation = 1;
     st->justify     = true;
+    st->dropcap     = true;
     st->smooth      = false;
     st->paper[0] = 0xfa; st->paper[1] = 0xf7; st->paper[2] = 0xf0;
     st->ink[0]   = 0x1c; st->ink[1]   = 0x1a; st->ink[2]   = 0x18;
@@ -200,6 +208,7 @@ typedef struct {
     CGFloat         first, head, before;   /* indents and space above, pixels */
     CGFloat         mult;                  /* line height multiple */
     CTTextAlignment align;
+    bool            dropcap;               /* opens the chapter */
 } Para;
 
 typedef struct { Para *v; int n, cap; } Paras;
@@ -353,6 +362,20 @@ static void hyphen_points(const Block *b, CFLocaleRef loc, Breaks *br) {
     free(pts);
 }
 
+/* The opening of a chapter takes a sunk capital, but only where one would
+   look like anything: a paragraph of running prose, long enough to have lines
+   for the letter to sit in, that begins with a letter rather than a quotation
+   mark or a dash. */
+static bool wants_dropcap(const Block *b) {
+    if (b->type != BLK_TEXT || b->heading || b->center || b->indent) return false;
+    if (b->len < 160 || !b->text) return false;
+    unsigned char c = (unsigned char)b->text[0];
+    if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    /* Latin letters carrying accents, but not punctuation or quotes. */
+    unsigned cp = (c & 0xE0) == 0xC0 ? ((c & 0x1Fu) << 6) | ((unsigned char)b->text[1] & 0x3Fu) : 0;
+    return cp >= 0xC0 && cp <= 0x24F;
+}
+
 /* Bytes of `b` from `from` that share one style. */
 static int style_run(const Block *b, int from) {
     if (!b->style) return b->len - from;
@@ -390,6 +413,7 @@ static CFAttributedStringRef build(const Doc *d, const TypeStyle *st, const Font
     CFDictionaryRef plain = attrs_make(f->reg, ink);
     bool prev_break = true;      /* the chapter's first paragraph is flush */
     bool after_heading = false;
+    bool capped = false;         /* one sunk capital to a chapter */
 
     for (int i = 0; i < d->nblocks; i++) {
         const Block *b = &d->blocks[i];
@@ -402,6 +426,7 @@ static CFAttributedStringRef build(const Doc *d, const TypeStyle *st, const Font
             pa->start = CFAttributedStringGetLength(m);
             Block rule = { .type = BLK_TEXT, .center = true, .before = 2 };
             para_shape(pa, st, &rule, false, false);
+            pa->dropcap = false;
             append_run(m, marks, "* * *", 5, i, 0, plain);
             append_run(m, marks, "\n", 1, -1, 0, plain);
             pa->end = CFAttributedStringGetLength(m);
@@ -418,6 +443,8 @@ static CFAttributedStringRef build(const Doc *d, const TypeStyle *st, const Font
         para_shape(pa, st, b, st->indent > 0 && !b->heading && !b->center &&
                               b->indent == 0 && b->before <= 1 && !prev_break,
                    after_heading);
+        pa->dropcap = !capped && st->dropcap && wants_dropcap(b);
+        if (pa->dropcap) capped = true;
 
         CFDictionaryRef cache[8] = {0};      /* one per DS_* combination */
         if (loc && !b->heading) hyphen_points(b, loc, &br); else br.n = 0;
@@ -479,6 +506,26 @@ static void resolve(const Marks *m, const Doc *d, CFIndex end, int *block, int *
     *off   = 0;
 }
 
+/* The type size on a line, which is what its height is a multiple of - a
+   heading is set larger and takes proportionally more room. Font ascent and
+   descent are no use for this: they bound the extremes a face can reach, and
+   for some faces that is well over an em, which would space every line out by
+   however much room the font reserves for accents nobody typed. */
+static double line_em(CTLineRef line) {
+    CFArrayRef runs = CTLineGetGlyphRuns(line);
+    double em = 0;
+    for (CFIndex i = 0; runs && i < CFArrayGetCount(runs); i++) {
+        CTRunRef r = CFArrayGetValueAtIndex(runs, i);
+        CFDictionaryRef a = CTRunGetAttributes(r);
+        CTFontRef f = a ? CFDictionaryGetValue(a, kCTFontAttributeName) : NULL;
+        if (f) {
+            double sz = CTFontGetSize(f);
+            if (sz > em) em = sz;
+        }
+    }
+    return em;
+}
+
 static double line_width(CTLineRef line) {
     return CTLineGetTypographicBounds(line, NULL, NULL, NULL) -
            CTLineGetTrailingWhitespaceWidth(line);
@@ -516,9 +563,42 @@ struct TypeChapter {
     Paras           paras;
     double          hyphen_w;
     int             w, h;
+    int             ncols;         /* columns the page is divided into */
+    double          colw, gutter, x0;
     CFIndex        *start;         /* where each page begins in the string */
     int             npages, cap;
 };
+
+/* How wide a column may be, and how many of them fit.
+ *
+ * A line much longer than about seventy characters is hard to read: the eye
+ * loses the start of the next line on the way back. So a column is capped at
+ * the measure, and a page with room for more than one gets more than one
+ * rather than one very long line. Whatever is left over is split evenly at
+ * either side, which centres the text on a window too wide for it. */
+static void columns_fit(TypeChapter *tc) {
+    const TypeStyle *st = &tc->st;
+    double avail = tc->w - 2 * st->margin;
+    double gutter = st->size * 2.2;
+    double widest = st->measure > 0 ? st->measure * st->size : avail;
+
+    int n = st->columns;
+    if (n <= 0) {
+        n = (int)((avail + gutter) / (widest + gutter));
+        if (n < 1) n = 1;
+        if (n > 3) n = 3;
+    }
+    /* Columns too narrow to hold a line of words are worse than one wide one. */
+    while (n > 1 && (avail - (n - 1) * gutter) / n < st->size * 11) n--;
+
+    double colw = (avail - (n - 1) * gutter) / n;
+    if (colw > widest) colw = widest;
+
+    tc->ncols  = n;
+    tc->colw   = colw;
+    tc->gutter = gutter;
+    tc->x0     = (tc->w - (n * colw + (n - 1) * gutter)) / 2;
+}
 
 TypeChapter *type_open(const Doc *d, const TypeStyle *st) {
     if (!d || !st) return NULL;
@@ -569,13 +649,121 @@ static int para_at(const TypeChapter *tc, CFIndex pos) {
     return tc->paras.n;
 }
 
+/* A sunk capital, ready to be drawn: the letter, how much room the lines
+   beside it have to give up, and where it sits relative to the first line. */
+typedef struct {
+    CTLineRef line;
+    double    w;         /* width of its ink */
+    double    gap;       /* air between it and the lines beside it */
+    double    x_off;     /* left side bearing, cancelled so ink meets the margin */
+    double    base_off;  /* its baseline, from the first line's baseline */
+} Cap;
+
+/* Decorated initials come one letter to a file, every file claiming the same
+   family name, so they cannot be installed side by side and are opened by
+   path instead. */
+static CTFontRef initial_font(const char *dir, UniChar ch, double size) {
+    if (!dir || !*dir) return NULL;
+    if (ch >= 'a' && ch <= 'z') ch = (UniChar)(ch - 32);
+    if (ch < 'A' || ch > 'Z') return NULL;
+
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%c.ttf", dir, (char)ch);
+    CGDataProviderRef dp = CGDataProviderCreateWithFilename(path);
+    if (!dp) return NULL;
+    CGFontRef cg = CGFontCreateWithDataProvider(dp);
+    CGDataProviderRelease(dp);
+    if (!cg) return NULL;
+    CTFontRef f = CTFontCreateWithGraphicsFont(cg, size, NULL, NULL);
+    CGFontRelease(cg);
+    return f;
+}
+
+static CTLineRef cap_draw_line(const TypeChapter *tc, CFStringRef ch, CTFontRef font) {
+    CFDictionaryRef attrs = attrs_make(font, tc->ink);
+    CFAttributedStringRef as = CFAttributedStringCreate(NULL, ch, attrs);
+    CTLineRef line = as ? CTLineCreateWithAttributedString(as) : NULL;
+    if (as) CFRelease(as);
+    CFRelease(attrs);
+    return line;
+}
+
+/* Size the initial so its ink spans `lines` lines of body text - top level
+   with the first line's capitals, foot on the last line's baseline. It is the
+   ink that is measured, not the font's metrics: a decorated letter carries
+   flourishes its metrics know nothing about. */
+static bool cap_make(const TypeChapter *tc, CFIndex at, CFIndex len, int lines,
+                     CGFloat mult, Cap *out, int *lines_used) {
+    memset(out, 0, sizeof *out);
+    CTFontRef body = tc->f.reg;
+    double cap_h = CTFontGetCapHeight(body);
+    double lh = tc->st.size * mult;
+    double span = cap_h + (lines - 1) * lh;   /* first line's cap top to last baseline */
+    double want = span;
+    *lines_used = lines;
+    if (span <= 0) return false;
+
+    CFStringRef ch = CFStringCreateWithSubstring(NULL, tc->text, CFRangeMake(at, len));
+    if (!ch) return false;
+    UniChar first = CFStringGetCharacterAtIndex(ch, 0);
+
+    const double probe = 100;
+    CTFontRef pf = initial_font(tc->st.initials, first, probe);
+    /* A decorated initial spends much of its height on flourishes around the
+       letter, so it is given a line more to work in - otherwise the letter
+       inside the ornament comes out smaller than a plain capital would. */
+    bool decorated = pf != NULL;
+    if (decorated) {
+        lines += 1;
+        span = cap_h + (lines - 1) * lh;
+        /* An ornament reaches to the edge of its ink on every side, so it is
+           set a little short of the lines it spans and centred in them. A
+           plain capital has its own white space built in and takes the full
+           span, foot square on the last baseline. */
+        want = span * 0.90;
+    }
+    *lines_used = lines;
+    if (!pf) pf = CTFontCreateCopyWithAttributes(body, probe, NULL, NULL);
+    CTLineRef pl = pf ? cap_draw_line(tc, ch, pf) : NULL;
+    if (!pl) {
+        if (pf) CFRelease(pf);
+        CFRelease(ch);
+        return false;
+    }
+    CGRect ink = CTLineGetImageBounds(pl, NULL);
+    CFRelease(pl);
+
+    bool ok = false;
+    if (ink.size.height > 0) {
+        double size = probe * want / ink.size.height;
+        CTFontRef ff = initial_font(tc->st.initials, first, size);
+        if (!ff) ff = CTFontCreateCopyWithAttributes(body, size, NULL, NULL);
+        CTLineRef fl = ff ? cap_draw_line(tc, ch, ff) : NULL;
+        if (fl) {
+            CGRect b = CTLineGetImageBounds(fl, NULL);
+            double top = cap_h - (span - b.size.height) / 2;  /* air split above
+                                                                and below */
+            out->line     = fl;
+            out->w        = b.size.width;
+            out->gap      = tc->st.size * (decorated ? 0.36 : 0.18);
+            out->x_off    = -b.origin.x;
+            out->base_off = top - (b.origin.y + b.size.height);
+            ok = true;
+        }
+        if (ff) CFRelease(ff);
+    }
+    CFRelease(pf);
+    CFRelease(ch);
+    return ok;
+}
+
 /* Set one page from `pos`, drawing it if there is a context, and answer with
    the index it ran out of room at. Measuring and drawing walk the same path,
    so the pages a chapter is split into are the pages that get drawn. */
-static CFIndex layout_page(TypeChapter *tc, CFIndex pos, CGContextRef ctx) {
+static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double right,
+                             double top, double bottom, CGContextRef ctx) {
     const TypeStyle *st = &tc->st;
-    double left = st->margin, right = tc->w - st->margin;
-    double bottom = st->margin, y = tc->h - st->margin;
+    double y = top;
     if (right - left <= st->size) return pos;
 
     CFIndex total = CFAttributedStringGetLength(tc->str);
@@ -589,8 +777,38 @@ static CFIndex layout_page(TypeChapter *tc, CFIndex pos, CGContextRef ctx) {
         double after = page_top ? y : y - pa->before;
         bool first = pos == pa->start;
 
+        /* The sunk capital is set once, where its paragraph begins, and only
+           where the lines it needs are still on this page. It leaves the flow
+           entirely: the letter is drawn by hand and the lines beside it are
+           indented past it. */
+        Cap cap = {0};
+        double cap_gap = 0;
+        int cap_lines = 0;
+        if (pa->dropcap && first) {
+            double lh_body = st->size * pa->mult;
+            int want = 3;
+            CFRange g = CFStringGetRangeOfComposedCharactersAtIndex(tc->text, pos);
+            int used = want;
+            if (cap_make(tc, g.location, g.length, want, pa->mult, &cap, &used)) {
+                /* Only if every line it reaches beside is still on this page. */
+                if (after - (used - 1) * lh_body - CTFontGetDescent(tc->f.reg) >= bottom) {
+                    cap_lines = used;
+                    cap_gap   = cap.gap;
+                    pos      += g.length;    /* set by hand, not in the flow */
+                } else {
+                    CFRelease(cap.line);
+                    cap.line = NULL;
+                }
+            }
+        }
+        int line_no = 0;
+        double cap_base = 0;
+
         while (pos < pa->end && !full) {
-            double indent = first ? pa->first : pa->head;
+            /* A sunk capital stands in for the paragraph's opening indent, and
+               the lines it reaches beside are held clear of it. */
+            double indent = cap_lines ? pa->head : (first ? pa->first : pa->head);
+            if (line_no < cap_lines) indent += cap.w + cap_gap;
             double avail  = right - left - indent;
             if (avail <= st->size) { full = true; break; }
 
@@ -620,8 +838,13 @@ static CFIndex layout_page(TypeChapter *tc, CFIndex pos, CGContextRef ctx) {
 
             double asc, desc, lead;
             CTLineGetTypographicBounds(line, &asc, &desc, &lead);
-            double lh = (asc + desc + lead) * pa->mult;
-            if (after - asc * pa->mult - desc < bottom) {     /* out of page */
+            double em = line_em(line);
+            if (em <= 0) em = st->size;
+            double lh = em * pa->mult;
+            /* What the line does not fill of its height is split above and
+               below it, so the text sits centred in the space it is given. */
+            double base = after - (lh - (asc + desc)) / 2 - asc;
+            if (base - desc < bottom) {                      /* out of page */
                 CFRelease(line);
                 full = true;
                 break;
@@ -638,20 +861,47 @@ static CFIndex layout_page(TypeChapter *tc, CFIndex pos, CGContextRef ctx) {
                 double x = left + indent;
                 if (pa->align == kCTTextAlignmentCenter)
                     x = left + indent + (avail - line_width(draw)) / 2;
-                CGContextSetTextPosition(ctx, x, y - asc * pa->mult);
+                CGContextSetTextPosition(ctx, x, base);
                 CTLineDraw(draw, ctx);
                 if (draw != line) CFRelease(draw);
             }
             CFRelease(line);
 
+            if (line_no == 0) cap_base = base;
             after = y - lh;
             pos += n;
             first = false;
+            line_no++;
             page_top = false;
+        }
+
+        /* Drawn once the first line has fixed the baseline it hangs from. */
+        if (cap.line) {
+            if (ctx && line_no > 0) {
+                CGContextSetTextPosition(ctx, left + pa->head + cap.x_off,
+                                         cap_base + cap.base_off);
+                CTLineDraw(cap.line, ctx);
+            }
+            CFRelease(cap.line);
         }
         if (!full) y = after;
     }
     return pos > total ? total : pos;
+}
+
+/* A page is its columns, filled left to right. */
+static CFIndex layout_page(TypeChapter *tc, CFIndex pos, CGContextRef ctx) {
+    const TypeStyle *st = &tc->st;
+    CFIndex total = CFAttributedStringGetLength(tc->str);
+    double top = tc->h - st->margin, bottom = st->margin;
+
+    for (int c = 0; c < tc->ncols && pos < total; c++) {
+        double left = tc->x0 + c * (tc->colw + tc->gutter);
+        CFIndex end = layout_column(tc, pos, left, left + tc->colw, top, bottom, ctx);
+        if (end <= pos) break;          /* a column that holds nothing would loop */
+        pos = end;
+    }
+    return pos;
 }
 
 int type_paginate(TypeChapter *tc, int w, int h) {
@@ -659,6 +909,7 @@ int type_paginate(TypeChapter *tc, int w, int h) {
     tc->w = w;
     tc->h = h;
     tc->npages = 0;
+    columns_fit(tc);
     if (!tc->ts || tc->paras.n == 0) return 0;
 
     CFIndex total = CFAttributedStringGetLength(tc->str);

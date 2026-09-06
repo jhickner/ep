@@ -1106,6 +1106,7 @@ static int read_epub(const char *path, int width) {
    order they are worth trying. Any that a system turns out not to have is
    passed over. */
 static const char *TY_FONTS[] = {
+    "Source Serif 4",           /* not a system font; installed, or skipped */
     "Iowan Old Style", "Charter", "Palatino", "Athelas", "Hoefler Text",
     "Baskerville", "Georgia", "PT Serif", "STIX Two Text",
 };
@@ -1122,6 +1123,7 @@ typedef struct {
     TypeChapter *tc;
     TypeStyle    st;
     char         font[128];
+    char         initials[PATH_MAX];   /* per-letter fonts for sunk capitals */
     bool         paper;       /* paint a page rather than sit on the terminal */
     bool         fill;        /* fill the pane rather than hold a page shape */
 
@@ -1161,6 +1163,10 @@ static void ty_conf_load(Ty *t) {
         else if (!strcmp(line, "fill")) t->fill = atoi(sp) != 0;
         else if (!strcmp(line, "justify")) t->st.justify = atoi(sp) != 0;
         else if (!strcmp(line, "hyphenate")) t->st.hyphenation = atoi(sp) ? 1 : 0;
+        else if (!strcmp(line, "dropcap")) t->st.dropcap = atoi(sp) != 0;
+        else if (!strcmp(line, "leading") && atof(sp) >= 1) t->st.leading = atof(sp);
+        else if (!strcmp(line, "measure") && atof(sp) >= 12) t->st.measure = atof(sp);
+        else if (!strcmp(line, "columns")) t->st.columns = atoi(sp);
         else if (!strcmp(line, "font") && *sp) snprintf(t->font, sizeof t->font, "%s", sp);
     }
     fclose(f);
@@ -1173,9 +1179,11 @@ static void ty_conf_save(const Ty *t) {
     ty_conf_path(path, sizeof path);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "size %.1f\npaper %d\nfill %d\njustify %d\nhyphenate %d\nfont %s\n",
-            t->st.size, t->paper, t->fill, t->st.justify,
-            t->st.hyphenation > 0 ? 1 : 0, t->font);
+    fprintf(f, "size %.1f\nleading %.2f\nmeasure %.0f\ncolumns %d\npaper %d\n"
+               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nfont %s\n",
+            t->st.size, t->st.leading, t->st.measure, t->st.columns, t->paper,
+            t->fill, t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
+            t->st.dropcap, t->font);
     fclose(f);
 }
 
@@ -1241,8 +1249,9 @@ static Doc ty_parse(Epub *bk, int spine) {
 /* Build and paginate the current chapter, opening at (block, off). */
 static void ty_build(Ty *t, int block, int off) {
     if (t->tc) { type_close(t->tc); t->tc = NULL; }
-    t->st.family = t->font;
-    t->st.margin = t->st.size * 2.6;
+    t->st.family   = t->font;
+    t->st.initials = t->initials[0] ? t->initials : NULL;
+    t->st.margin   = t->st.size * 2.6;
     ty_palette(t);
     t->tc = type_open(&t->doc, &t->st);
     t->npages = t->w > 0 && t->h > 0 ? type_paginate(t->tc, t->w, t->h) : 0;
@@ -1284,8 +1293,12 @@ static void draw_ty_status(Screen *s, const Ty *t) {
     screen_print(s, 1, y, ty_title(t->bk, t->spine), C_DIM, C_BG);
 
     char right[200];
-    snprintf(right, sizeof right, "%s %.0f %s %s   %d/%d   ch %d/%d   ? help",
-             t->font, t->st.size, t->st.transparent ? "term" : "paper",
+    char cols[16];
+    if (t->st.columns > 0) snprintf(cols, sizeof cols, "%dcol", t->st.columns);
+    else                   snprintf(cols, sizeof cols, "auto");
+    snprintf(right, sizeof right, "%s %.0f/%.2f %s %s %s   %d/%d   ch %d/%d   ? help",
+             t->font, t->st.size, t->st.leading, cols,
+             t->st.transparent ? "term" : "paper",
              t->fill ? "fill" : "page",
              t->npages ? t->page + 1 : 0, t->npages,
              t->spine + 1, t->bk->nspine);
@@ -1302,6 +1315,10 @@ static void draw_ty_help(Screen *s) {
         "  + -                 larger / smaller type",
         "  d                   painted page / terminal colours",
         "  F                   next serif face",
+        "  C                   sunk capital at a chapter's opening",
+        "  { }                 tighter / looser line spacing",
+        "  1 2 3               columns;  0 fits as many as will read well",
+        "  m M                 narrower / wider column",
         "  w                   fill the pane",
         "  J                   justified text",
         "  H                   hyphenation",
@@ -1346,6 +1363,12 @@ static int read_typeset(const char *path) {
     memcpy(t.term_fg, g_term_fg, 3);
     type_style_default(&t.st);
     snprintf(t.font, sizeof t.font, "%s", t.st.family);
+    /* Decorated initials, if any have been put there. */
+    char cfgdir[PATH_MAX];
+    state_dir(cfgdir, sizeof cfgdir);
+    snprintf(t.initials, sizeof t.initials, "%s/initials", cfgdir);
+    struct stat ist;
+    if (stat(t.initials, &ist) != 0 || !S_ISDIR(ist.st_mode)) t.initials[0] = 0;
     t.st.size = g_cell_h * 0.9;
     ty_conf_load(&t);
     const char *env = getenv("EP_FONT");
@@ -1481,6 +1504,32 @@ static int read_typeset(const char *path) {
                         break;
                     case 'd': t.paper = !t.paper; ty_restyle(&t); dirty = true; break;
                     case 'F': ty_font_cycle(&t, +1); ty_restyle(&t); dirty = true; break;
+                    case 'C': t.st.dropcap = !t.st.dropcap; ty_restyle(&t); dirty = true; break;
+                    case '0': case '1': case '2': case '3':
+                        t.st.columns = ev.ch - '0';
+                        ty_restyle(&t);
+                        dirty = true;
+                        break;
+                    case 'm':      /* narrower measure */
+                        if (t.st.measure > 20) { t.st.measure -= 2; ty_restyle(&t); dirty = true; }
+                        break;
+                    case 'M':      /* wider */
+                        if (t.st.measure < 60) { t.st.measure += 2; ty_restyle(&t); dirty = true; }
+                        break;
+                    case '{':
+                        if (t.st.leading > 1.02) {
+                            t.st.leading -= 0.04;
+                            ty_restyle(&t);
+                            dirty = true;
+                        }
+                        break;
+                    case '}':
+                        if (t.st.leading < 2.2) {
+                            t.st.leading += 0.04;
+                            ty_restyle(&t);
+                            dirty = true;
+                        }
+                        break;
                     case 'w': t.fill = !t.fill; dirty = true; break;
                     case 'J': t.st.justify = !t.st.justify; ty_restyle(&t); dirty = true; break;
                     case 'H':

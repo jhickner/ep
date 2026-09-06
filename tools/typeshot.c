@@ -44,6 +44,9 @@ int main(int argc, char **argv) {
     st.margin = size * 2.6;
     if (getenv("EP_NOJUSTIFY")) st.justify = false;
     if (getenv("EP_NOHYPHEN")) st.hyphenation = 0;
+    if (getenv("EP_LEADING")) st.leading = atof(getenv("EP_LEADING"));
+    if (getenv("EP_COLUMNS")) st.columns = atoi(getenv("EP_COLUMNS"));
+    if (getenv("EP_MEASURE")) st.measure = atof(getenv("EP_MEASURE"));
     unsigned rr, gg, bb;
     if (getenv("EP_PAPER") && sscanf(getenv("EP_PAPER"), "%2x%2x%2x", &rr, &gg, &bb) == 3) {
         st.paper[0] = rr; st.paper[1] = gg; st.paper[2] = bb;
@@ -53,6 +56,9 @@ int main(int argc, char **argv) {
     }
 
     if (getenv("EP_TRANSPARENT")) st.transparent = true;
+    static char initials[512];
+    snprintf(initials, sizeof initials, "%s/.config/ep/initials", getenv("HOME"));
+    st.initials = getenv("EP_NOINITIALS") ? NULL : initials;
 
     TypeChapter *tc = type_open(&d, &st);
     int total = type_paginate(tc, w, h);
