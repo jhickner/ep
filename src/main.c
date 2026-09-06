@@ -1191,6 +1191,7 @@ static void ty_conf_load(Ty *t) {
         else if (!strcmp(line, "justify")) t->st.justify = atoi(sp) != 0;
         else if (!strcmp(line, "hyphenate")) t->st.hyphenation = atoi(sp) ? 1 : 0;
         else if (!strcmp(line, "dropcap")) t->st.dropcap = atoi(sp) != 0;
+        else if (!strcmp(line, "smallcaps")) t->st.smallcaps = atoi(sp) != 0;
         else if (!strcmp(line, "leading") && atof(sp) >= 1) t->st.leading = atof(sp);
         else if (!strcmp(line, "measure") && atof(sp) >= 12) t->st.measure = atof(sp);
         else if (!strcmp(line, "columns")) t->st.columns = atoi(sp);
@@ -1206,10 +1207,10 @@ static void ty_conf_save(const Ty *t) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "size %.1f\nleading %.2f\nmeasure %.0f\ncolumns %d\npaper %d\n"
-               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\n",
+               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nsmallcaps %d\n",
             t->st.size, t->st.leading, t->st.measure, t->st.columns, t->paper,
             t->fill, t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
-            t->st.dropcap);
+            t->st.dropcap, t->st.smallcaps);
     fclose(f);
 }
 

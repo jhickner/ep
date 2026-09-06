@@ -36,6 +36,7 @@ typedef struct {
     double      hyphenation; /* 0 off, 1 hyphenate freely */
     bool        justify;
     bool        dropcap;     /* sink the chapter's opening letter */
+    bool        smallcaps;   /* headings, and the line a sunk capital opens */
     const char *initials;    /* directory of per-letter initial fonts, or NULL */
     bool        smooth;      /* subpixel antialiasing */
     bool        transparent; /* leave the paper clear, ignoring paper[] */
@@ -88,6 +89,7 @@ void type_style_default(TypeStyle *st) {
     st->hyphenation = 1;
     st->justify     = true;
     st->dropcap     = true;
+    st->smallcaps   = true;
     st->smooth      = false;
     st->paper[0] = 0xfa; st->paper[1] = 0xf7; st->paper[2] = 0xf0;
     st->ink[0]   = 0x1c; st->ink[1]   = 0x1a; st->ink[2]   = 0x18;
@@ -153,7 +155,25 @@ static CFIndex bytes_to_u16(const char *s, int len) {
 
 /* ---------------------------------------------------------------- fonts -- */
 
-typedef struct { CTFontRef reg, bold, ital, bi, head; } Fonts;
+typedef struct { CTFontRef reg, bold, ital, bi, head, sc; } Fonts;
+
+/* Real small capitals, where the face has them - drawn to match the lowercase
+   in weight, which capitals set small never do. A face without them is handed
+   back unchanged rather than faked. */
+static CTFontRef font_smallcaps(CTFontRef base, double size) {
+    CTFontDescriptorRef d = CTFontCopyFontDescriptor(base);
+    if (!d) return (CTFontRef)CFRetain(base);
+    int type = kLowerCaseType, sel = kLowerCaseSmallCapsSelector;
+    CFNumberRef t = CFNumberCreate(NULL, kCFNumberIntType, &type);
+    CFNumberRef v = CFNumberCreate(NULL, kCFNumberIntType, &sel);
+    CTFontDescriptorRef sd = t && v ? CTFontDescriptorCreateCopyWithFeature(d, t, v) : NULL;
+    CTFontRef f = sd ? CTFontCreateWithFontDescriptor(sd, size, NULL) : NULL;
+    if (sd) CFRelease(sd);
+    if (t) CFRelease(t);
+    if (v) CFRelease(v);
+    CFRelease(d);
+    return f ? f : (CTFontRef)CFRetain(base);
+}
 
 static CTFontRef variant(CTFontRef base, CTFontSymbolicTraits want, double size) {
     CTFontRef f = CTFontCreateCopyWithSymbolicTraits(base, size, NULL, want,
@@ -189,6 +209,12 @@ static void fonts_make(Fonts *f, const TypeStyle *st) {
     f->ital = variant(base, kCTFontTraitItalic, st->size);
     f->bi   = variant(base, kCTFontTraitBold | kCTFontTraitItalic, st->size);
     f->head = variant(base, kCTFontTraitBold, st->size * 1.22);
+    if (st->smallcaps) {
+        CTFontRef plain = f->head;
+        f->head = font_smallcaps(plain, st->size * 1.22);
+        CFRelease(plain);
+    }
+    f->sc = font_smallcaps(base, st->size);
 }
 
 static void fonts_free(Fonts *f) {
@@ -197,6 +223,7 @@ static void fonts_free(Fonts *f) {
     if (f->ital) CFRelease(f->ital);
     if (f->bi)   CFRelease(f->bi);
     if (f->head) CFRelease(f->head);
+    if (f->sc)   CFRelease(f->sc);
 }
 
 /* ----------------------------------------------------------- paragraphs -- */
@@ -795,6 +822,14 @@ static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double r
                     cap_lines = used;
                     cap_gap   = cap.gap;
                     pos      += g.length;    /* set by hand, not in the flow */
+                    /* A one-letter opening word - "A", "I" - leaves its space
+                       behind when the letter is lifted out, and the line
+                       would start indented by it. */
+                    while (pos < pa->end) {
+                        UniChar c = CFStringGetCharacterAtIndex(tc->text, pos);
+                        if (c != ' ' && c != '\t' && c != 0x00A0) break;
+                        pos++;
+                    }
                 } else {
                     CFRelease(cap.line);
                     cap.line = NULL;
@@ -812,12 +847,45 @@ static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double r
             double avail  = right - left - indent;
             if (avail <= st->size) { full = true; break; }
 
-            CFIndex n = CTTypesetterSuggestLineBreak(tc->ts, pos, avail - tc->hyphen_w);
+            /* The line a sunk capital opens is set in small capitals, so it
+               is broken against a copy of the text wearing them - their widths
+               are not the lowercase widths, and breaking against the wrong
+               ones would leave the line long or short. The copy is character
+               for character the text it came from, so what it consumes counts
+               the same in the string everything else is measured in. */
+            CFAttributedStringRef sc = NULL;
+            if (line_no == 0 && cap_lines > 0 && st->smallcaps && tc->f.sc) {
+                CFStringRef run = CFStringCreateWithSubstring(NULL, tc->text,
+                                      CFRangeMake(pos, pa->end - pos));
+                if (run) {
+                    CFDictionaryRef a = attrs_make(tc->f.sc, tc->ink);
+                    sc = CFAttributedStringCreate(NULL, run, a);
+                    CFRelease(a);
+                    CFRelease(run);
+                }
+            }
+
+            CFIndex n;
+            CTLineRef line = NULL;
+            if (sc) {
+                CTTypesetterRef ts = CTTypesetterCreateWithAttributedString(sc);
+                n = ts ? CTTypesetterSuggestLineBreak(ts, 0, avail - tc->hyphen_w) : 0;
+                if (n > pa->end - pos) n = pa->end - pos;
+                if (n > 0) {
+                    bool hy = CFStringGetCharacterAtIndex(tc->text, pos + n - 1) == SOFT_HYPHEN_CH;
+                    line = make_line(sc, 0, n, hy && ctx != NULL);
+                }
+                if (ts) CFRelease(ts);
+                if (!line) { CFRelease(sc); full = true; break; }
+                goto have_line;
+            }
+
+            n = CTTypesetterSuggestLineBreak(tc->ts, pos, avail - tc->hyphen_w);
             if (n <= 0) { full = true; break; }
             if (pos + n > pa->end) n = pa->end - pos;
 
             bool hyphen = CFStringGetCharacterAtIndex(tc->text, pos + n - 1) == SOFT_HYPHEN_CH;
-            CTLineRef line = make_line(tc->str, pos, n, hyphen && ctx != NULL);
+            line = make_line(tc->str, pos, n, hyphen && ctx != NULL);
             if (!line) { full = true; break; }
 
             /* A line that did not need the hyphen's room gets it back. */
@@ -836,6 +904,7 @@ static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double r
                 }
             }
 
+        have_line:;
             double asc, desc, lead;
             CTLineGetTypographicBounds(line, &asc, &desc, &lead);
             double em = line_em(line);
@@ -846,6 +915,7 @@ static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double r
             double base = after - (lh - (asc + desc)) / 2 - asc;
             if (base - desc < bottom) {                      /* out of page */
                 CFRelease(line);
+                if (sc) CFRelease(sc);
                 full = true;
                 break;
             }
@@ -866,6 +936,7 @@ static CFIndex layout_column(TypeChapter *tc, CFIndex pos, double left, double r
                 if (draw != line) CFRelease(draw);
             }
             CFRelease(line);
+            if (sc) CFRelease(sc);
 
             if (line_no == 0) cap_base = base;
             after = y - lh;
