@@ -2,14 +2,15 @@ CC      ?= cc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 LDLIBS   = -lpthread -lz -lm
 ifeq ($(shell uname),Darwin)
-  LDLIBS += -framework CoreGraphics -framework CoreFoundation
+  LDLIBS += -framework CoreGraphics -framework CoreFoundation -framework CoreText
 endif
 PREFIX  ?= $(HOME)/.local
 
 BIN  = ep
-SRC  = src/main.c src/pdf.c
+SRC  = src/main.c src/pdf.c src/type.c
 DEPS = src/term.h src/screen.h src/kitty.h src/image.h src/stb_image.h \
-       src/zip.h src/xml.h src/epub.h src/doc.h src/layout.h src/state.h src/pick.h src/pdf.h
+       src/zip.h src/xml.h src/epub.h src/doc.h src/layout.h src/state.h src/pick.h src/pdf.h \
+       src/type.h
 
 # libjpeg-turbo decodes JPEGs straight out of the DCT at 1/2, 1/4 or 1/8 scale,
 # which is most of the cost of showing a cover.

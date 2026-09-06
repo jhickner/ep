@@ -41,8 +41,9 @@
 #include "state.h"
 #define PICK_IMPLEMENTATION
 #include "pick.h"
-#include "pdf.h"   /* implemented in pdf.c: its CoreGraphics headers and
-                      screen.h both want to own the name "Style" */
+#include "pdf.h"    /* implemented in pdf.c: its CoreGraphics headers and
+                       screen.h both want to own the name "Style" */
+#include "type.h"   /* implemented in type.c, for the same reason */
 
 #include <time.h>
 
@@ -92,8 +93,15 @@ typedef struct {
     int    ctotal;
 } Reader;
 
+#define KG_PROBE_MS 300
+
 static bool g_graphics;
 static int  g_cell_w = 10, g_cell_h = 20;
+
+/* What the terminal said about its own colours, asked for at the same time as
+   the graphics probe and for the same reason: both read stdin directly. */
+static bool    g_bg_known, g_fg_known, g_bg_light;
+static uint8_t g_term_fg[3];
 static char g_tmpdir[PATH_MAX];
 
 /* ------------------------------------------------------------- progress -- */
@@ -810,6 +818,7 @@ static void usage(void) {
         "  -w cols       text column width (default 76)\n"
         "  --resume      pick from the books you have been reading\n"
         "  --dump        print the book as wrapped text and exit\n"
+        "  --typeset     draw pages with a real typesetter (macOS, prototype)\n"
         "\n"
         "A directory is browsed; only epubs, PDFs and directories are listed.\n"
         "PDFs are shown as page images and need a kitty-graphics terminal.\n");
@@ -843,8 +852,43 @@ static int dump_epub(const char *path, int width) {
 
 /* ------------------------------------------------------------------- ui -- */
 
-static bool ui_start(Screen *s) {
+/* Everything that has to ask the terminal a question, done once before the
+   terminal is set up. These queries read stdin themselves, and term_init
+   starts a thread that owns it from then on - after that the thread wins the
+   race and the answers come back as keystrokes. */
+static void ui_detect(void) {
     kg_init();
+    kg_sweep_stale_tempfiles(3600);   /* whatever a crash left behind */
+    if (getenv("TMUX") && !kg_tmux_allow_passthrough())
+        fprintf(stderr, "ep: warning: could not set tmux allow-passthrough\n");
+
+    /* Under tmux a terminal that stays silent yields -1 rather than 0, because
+       the trick that tells the two apart is one tmux answers itself. What the
+       environment says is the only thing left to go on. */
+    int gfx = kg_probe(KG_PROBE_MS);
+    if (gfx == -1) gfx = kg_supported() ? 1 : 0;
+    /* EP_FORCE_GFX and EP_CELL stand in for a terminal that cannot answer the
+       probe - a capture harness, mainly. */
+    g_graphics = gfx > 0 || getenv("EP_FORCE_GFX") != NULL;
+
+    uint8_t bg[3];
+    if (term_query_background_color(&bg[0], &bg[1], &bg[2], 150)) {
+        g_bg_known = true;
+        g_bg_light = term_color_is_light(bg[0], bg[1], bg[2]);
+    }
+    g_fg_known = term_query_foreground_color(&g_term_fg[0], &g_term_fg[1],
+                                             &g_term_fg[2], 150);
+}
+
+static void ui_graphics_error(const char *what) {
+    fprintf(stderr, "ep: %s needs a terminal that speaks kitty graphics "
+                    "(kitty, Ghostty)\n", what);
+    if (getenv("TMUX"))
+        fprintf(stderr, "    inside tmux this also needs:  "
+                        "tmux set -g allow-passthrough all\n");
+}
+
+static bool ui_start(Screen *s) {
     if (!term_init(&g_tm)) {
         fprintf(stderr, "ep: needs a terminal\n");
         return false;
@@ -856,10 +900,6 @@ static bool ui_start(Screen *s) {
     term_hide_cursor();
     term_enable_mouse();
 
-    kg_tmux_allow_passthrough();
-    /* EP_FORCE_GFX and EP_CELL stand in for a terminal that cannot answer the
-       probe - a capture harness, mainly. */
-    g_graphics = kg_probe(300) > 0 || getenv("EP_FORCE_GFX") != NULL;
     if (g_graphics) {
         int cw, ch;
         const char *cell = getenv("EP_CELL");
@@ -1049,6 +1089,446 @@ static int read_epub(const char *path, int width) {
     return 0;
 }
 
+/* --------------------------------------------------------- typeset epub -- */
+
+/* The typeset reading mode: instead of wrapping a chapter onto the character
+   grid, hand it to type.h and show the pages it draws. A chapter is built once
+   and paginated, so turning either way is a step between pages that are
+   already known - and a page carries the same (block, offset) position the
+   wrapped reader uses, so the two modes can hand a book to each other. */
+
+#define TY_ID_BASE  8192
+#define TY_ID_SLOTS 4
+
+/* Used only for a painted page: one asked for, or one forced by a terminal
+   that would not say what colours it uses. */
+/* Serif faces that ship with macOS and hold up as book text, roughly in the
+   order they are worth trying. Any that a system turns out not to have is
+   passed over. */
+static const char *TY_FONTS[] = {
+    "Iowan Old Style", "Charter", "Palatino", "Athelas", "Hoefler Text",
+    "Baskerville", "Georgia", "PT Serif", "STIX Two Text",
+};
+#define TY_NFONTS ((int)(sizeof TY_FONTS / sizeof TY_FONTS[0]))
+
+static const uint8_t TY_LIGHT_PAPER[3] = { 0xfa, 0xf7, 0xf0 };
+static const uint8_t TY_LIGHT_INK[3]   = { 0x1c, 0x1a, 0x18 };
+static const uint8_t TY_DARK_PAPER[3]  = { 0x18, 0x18, 0x1b };
+static const uint8_t TY_DARK_INK[3]    = { 0xd2, 0xcc, 0xc0 };
+
+typedef struct {
+    Epub        *bk;
+    Doc          doc;
+    TypeChapter *tc;
+    TypeStyle    st;
+    char         font[128];
+    bool         paper;       /* paint a page rather than sit on the terminal */
+    bool         fill;        /* fill the pane rather than hold a page shape */
+
+    /* What the terminal said about its own colours. The background is only
+       wanted for its polarity - whether a page can sit on it - since a page
+       that does sit on it is drawn clear rather than painted to match. */
+    bool         bg_known, fg_known;
+    bool         bg_light;
+    uint8_t      term_fg[3];
+
+    int          spine, page, npages;
+    int          cols, rows, w, h;
+} Ty;
+
+/* -------- settings, kept beside the reading history in ~/.config/ep -------- */
+
+static void ty_conf_path(char *out, size_t n) {
+    char dir[PATH_MAX];
+    state_dir(dir, sizeof dir);
+    snprintf(out, n, "%s/typeset", dir);
+}
+
+static void ty_conf_load(Ty *t) {
+    char path[PATH_MAX];
+    ty_conf_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *sp = strchr(line, ' ');
+        if (!sp) continue;
+        *sp++ = 0;
+        if (!strcmp(line, "size") && atof(sp) >= 6) t->st.size = atof(sp);
+        else if (!strcmp(line, "paper")) t->paper = atoi(sp) != 0;
+        else if (!strcmp(line, "fill")) t->fill = atoi(sp) != 0;
+        else if (!strcmp(line, "justify")) t->st.justify = atoi(sp) != 0;
+        else if (!strcmp(line, "hyphenate")) t->st.hyphenation = atoi(sp) ? 1 : 0;
+        else if (!strcmp(line, "font") && *sp) snprintf(t->font, sizeof t->font, "%s", sp);
+    }
+    fclose(f);
+}
+
+static void ty_conf_save(const Ty *t) {
+    char dir[PATH_MAX], path[PATH_MAX];
+    state_dir(dir, sizeof dir);
+    mkdir(dir, 0700);
+    ty_conf_path(path, sizeof path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "size %.1f\npaper %d\nfill %d\njustify %d\nhyphenate %d\nfont %s\n",
+            t->st.size, t->paper, t->fill, t->st.justify,
+            t->st.hyphenation > 0 ? 1 : 0, t->font);
+    fclose(f);
+}
+
+/* A page reads as part of the window rather than a slide laid over it, so by
+   default nothing is painted at all: the paper is left clear and what shows
+   through is the terminal's own background - exactly, with no colour to get
+   wrong, and still exact after a theme change, through transparency or over a
+   background image. The ink is the terminal's foreground, which contrasts with
+   that background by construction, so the background never has to be known.
+ *
+ * Painting is for asking for something the terminal is not: a cream page on a
+   dark theme. That, and a terminal that would not say what its foreground is. */
+/* The next face along that this system actually has. */
+static void ty_font_cycle(Ty *t, int dir) {
+    int at = 0;
+    for (int i = 0; i < TY_NFONTS; i++)
+        if (!strcmp(TY_FONTS[i], t->font)) { at = i; break; }
+    for (int n = 1; n <= TY_NFONTS; n++) {
+        const char *cand = TY_FONTS[((at + dir * n) % TY_NFONTS + TY_NFONTS) % TY_NFONTS];
+        if (type_font_exists(cand)) {
+            snprintf(t->font, sizeof t->font, "%s", cand);
+            return;
+        }
+    }
+}
+
+static void ty_palette(Ty *t) {
+    if (!t->paper && t->fg_known) {
+        t->st.transparent = true;
+        memcpy(t->st.ink, t->term_fg, 3);
+        return;
+    }
+    t->st.transparent = false;
+    bool term_light = t->bg_known && t->bg_light;
+    bool light = t->paper ? !term_light : term_light;
+    memcpy(t->st.paper, light ? TY_LIGHT_PAPER : TY_DARK_PAPER, 3);
+    memcpy(t->st.ink,   light ? TY_LIGHT_INK   : TY_DARK_INK,   3);
+}
+
+/* ------------------------------------------------------------- chapters -- */
+
+static const char *ty_title(const Epub *bk, int spine) {
+    for (int i = 0; i < bk->ntoc; i++)
+        if (bk->toc[i].spine == spine && bk->toc[i].title && *bk->toc[i].title)
+            return bk->toc[i].title;
+    return "";
+}
+
+static Doc ty_parse(Epub *bk, int spine) {
+    Doc d = {0};
+    if (spine < 0 || spine >= bk->nspine) return d;
+    char *xhtml = epub_read(bk, bk->spine[spine], NULL);
+    if (!xhtml) return d;
+    char base[512];
+    snprintf(base, sizeof base, "%s", bk->spine[spine]);
+    char *slash = strrchr(base, '/');
+    if (slash) slash[1] = 0; else base[0] = 0;
+    d = doc_parse(xhtml, base);
+    free(xhtml);
+    return d;
+}
+
+/* Build and paginate the current chapter, opening at (block, off). */
+static void ty_build(Ty *t, int block, int off) {
+    if (t->tc) { type_close(t->tc); t->tc = NULL; }
+    t->st.family = t->font;
+    t->st.margin = t->st.size * 2.6;
+    ty_palette(t);
+    t->tc = type_open(&t->doc, &t->st);
+    t->npages = t->w > 0 && t->h > 0 ? type_paginate(t->tc, t->w, t->h) : 0;
+    t->page   = t->npages ? type_page_of(t->tc, block, off) : 0;
+}
+
+/* Move to a chapter, opening at (block, off). A chapter that sets no pages -
+   one that is nothing but a cover image, say - is stepped over in whichever
+   direction the reader was already going. */
+static void ty_chapter(Ty *t, int spine, int block, int off, int dir) {
+    while (spine >= 0 && spine < t->bk->nspine) {
+        doc_free(&t->doc);
+        t->doc   = ty_parse(t->bk, spine);
+        t->spine = spine;
+        ty_build(t, block, off);
+        if (t->npages > 0 || dir == 0) return;
+        spine += dir;
+        block = off = 0;
+    }
+    /* Nothing further to show; stay where the last attempt left us. */
+}
+
+/* Where the reader is, which is what survives a change of size or style. */
+static void ty_here(const Ty *t, int *block, int *off) {
+    *block = 0;
+    *off   = 0;
+    if (t->npages > 0) type_page_start(t->tc, t->page, block, off);
+}
+
+static void ty_restyle(Ty *t) {
+    int block, off;
+    ty_here(t, &block, &off);
+    ty_build(t, block, off);
+}
+
+static void draw_ty_status(Screen *s, const Ty *t) {
+    int y = s->height - 1;
+    for (int x = 0; x < s->width; x++) screen_put(s, x, y, ' ', C_DIM, C_BG);
+    screen_print(s, 1, y, ty_title(t->bk, t->spine), C_DIM, C_BG);
+
+    char right[200];
+    snprintf(right, sizeof right, "%s %.0f %s %s   %d/%d   ch %d/%d   ? help",
+             t->font, t->st.size, t->st.transparent ? "term" : "paper",
+             t->fill ? "fill" : "page",
+             t->npages ? t->page + 1 : 0, t->npages,
+             t->spine + 1, t->bk->nspine);
+    int rw = (int)strlen(right);
+    if (rw < s->width - 2)
+        screen_print(s, s->width - rw - 1, y, right, C_DIM, C_BG);
+}
+
+static void draw_ty_help(Screen *s) {
+    static const char *rows[] = {
+        "  space / f / right   next page",
+        "  b / left            previous page",
+        "  n p  or  ] [        next / previous chapter",
+        "  + -                 larger / smaller type",
+        "  d                   painted page / terminal colours",
+        "  F                   next serif face",
+        "  w                   fill the pane",
+        "  J                   justified text",
+        "  H                   hyphenation",
+        "  q                   quit",
+    };
+    int n = (int)(sizeof rows / sizeof rows[0]);
+    int w = 40, h = n + 2;
+    int x0 = (s->width - w) / 2, y0 = (s->height - h) / 2;
+    if (x0 < 0 || y0 < 0) return;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            screen_put(s, x0 + x, y0 + y, ' ', C_FG, C_SEL);
+    for (int i = 0; i < n; i++) screen_print(s, x0, y0 + 1 + i, rows[i], C_FG, C_SEL);
+}
+
+static int read_typeset(const char *path) {
+    if (!type_available()) {
+        fprintf(stderr, "ep: --typeset needs the CoreText backend (macOS)\n");
+        return 1;
+    }
+    Epub bk;
+    if (!epub_open(&bk, path)) {
+        fprintf(stderr, "ep: cannot read epub: %s\n", path);
+        return 1;
+    }
+
+    Screen scr;
+    if (!ui_start(&scr)) { epub_close(&bk); return 1; }
+    Screen *s = &scr;
+    if (!g_graphics) {
+        ui_stop(s);
+        epub_close(&bk);
+        ui_graphics_error("--typeset");
+        return 1;
+    }
+
+    Ty t = {0};
+    t.bk = &bk;
+    t.bg_known = g_bg_known;
+    t.fg_known = g_fg_known;
+    t.bg_light = g_bg_light;
+    memcpy(t.term_fg, g_term_fg, 3);
+    type_style_default(&t.st);
+    snprintf(t.font, sizeof t.font, "%s", t.st.family);
+    t.st.size = g_cell_h * 0.9;
+    ty_conf_load(&t);
+    const char *env = getenv("EP_FONT");
+    if (env && *env) snprintf(t.font, sizeof t.font, "%s", env);
+    /* A name nothing answers to would quietly come back as Helvetica. */
+    if (!type_font_exists(t.font)) {
+        t.font[0] = 0;
+        ty_font_cycle(&t, +1);
+    }
+
+    int spine = 0, block = 0, off = 0;
+    StateLine saved;
+    int keep_page = 0, keep_total = 0;
+    if (state_lookup(path, &saved)) {
+        spine = saved.spine;
+        block = saved.block;
+        off   = saved.off;
+        keep_page  = saved.page;
+        keep_total = saved.total;
+        if (spine < 0 || spine >= bk.nspine) { spine = 0; block = off = 0; }
+    }
+
+    uint32_t id = 0, seq = 0;
+    bool have = false, running = true, dirty = true, help = false;
+    bool opened = false;
+
+    while (running) {
+        int box_cols = s->width, box_rows = s->height - 1;
+
+        if (dirty && box_cols >= 8 && box_rows >= 4) {
+            /* A page shaped like a page: the column is sized off the window's
+               height so the measure stays readable on a wide terminal. Filling
+               the pane gives that up for the room, which is what a narrow
+               window or a split wants. */
+            int rows = box_rows;
+            int cols = box_cols;
+            if (!t.fill) {
+                cols = (int)(rows * g_cell_h * 0.68) / g_cell_w;
+                if (cols > box_cols || cols < 8) cols = box_cols;
+            }
+            int w = cols * g_cell_w, h = rows * g_cell_h;
+
+            if (!opened) {
+                t.w = w; t.h = h; t.cols = cols; t.rows = rows;
+                ty_chapter(&t, spine, block, off, +1);
+                opened = true;
+            } else if (w != t.w || h != t.h) {
+                int b, o;
+                ty_here(&t, &b, &o);
+                t.w = w; t.h = h; t.cols = cols; t.rows = rows;
+                t.npages = type_paginate(t.tc, w, h);
+                t.page   = t.npages ? type_page_of(t.tc, b, o) : 0;
+            }
+
+            uint8_t *px = malloc((size_t)w * (size_t)h * 4);
+            if (px && type_draw(t.tc, t.page, px)) {
+                /* Rotating slots retires the old placement and, because the id
+                   rides in the cell's colour, makes the cells themselves
+                   differ - which is what gets them redrawn. */
+                uint32_t slot = TY_ID_BASE + (seq++ % TY_ID_SLOTS);
+                kg_delete(slot);
+                kg_transmit_ex(slot, px, w, h, 4);
+                kg_virtual_place(slot, cols, rows);
+                id = slot;
+                have = true;
+            }
+            free(px);
+
+            int x0 = (s->width - cols) / 2;
+            screen_clear(s, glyph_make(' ', C_FG, C_BG));
+            if (have)
+                for (int rr = 0; rr < rows; rr++)
+                    for (int cc = 0; cc < cols; cc++)
+                        screen_set(s, x0 + cc, rr, glyph_placeholder(id, rr, cc));
+            draw_ty_status(s, &t);
+            if (help) draw_ty_help(s);
+
+            kg_placeholder_redraw_begin();
+            screen_render(s);
+            kg_placeholder_redraw_end();
+            screen_swap(s);
+            term_flush();
+            dirty = false;
+        }
+
+        InputEvent ev;
+        if (!term_wait_event(&g_tm, &ev, 500)) continue;
+
+        if (ev.code == KEY_RESIZE) {
+            term_get_size(&g_tm);
+            screen_resize(s, g_tm.width, g_tm.height);
+            ui_cell_size();
+            dirty = true;
+            continue;
+        }
+        if (help) {
+            if (ev.code != KEY_NONE) { help = false; dirty = true; }
+            continue;
+        }
+
+        bool fwd = false, back = false;
+        switch (ev.code) {
+            case KEY_RIGHT: case KEY_SPACE: case KEY_PAGE_DOWN:
+            case KEY_DOWN:  case KEY_MOUSE_WHEEL_DOWN: fwd = true; break;
+            case KEY_LEFT:  case KEY_PAGE_UP:
+            case KEY_UP:    case KEY_MOUSE_WHEEL_UP:   back = true; break;
+            case KEY_HOME:  t.page = 0; dirty = true; break;
+            case KEY_END:   t.page = t.npages ? t.npages - 1 : 0; dirty = true; break;
+            case KEY_CHAR:
+                switch (ev.ch) {
+                    case 'q': running = false; break;
+                    case 'f': case 'j': fwd = true; break;
+                    case 'b': case 'k': back = true; break;
+                    case 'g': t.page = 0; dirty = true; break;
+                    case 'G': t.page = t.npages ? t.npages - 1 : 0; dirty = true; break;
+                    case 'n': case ']':
+                        if (t.spine < bk.nspine - 1) {
+                            ty_chapter(&t, t.spine + 1, 0, 0, +1);
+                            dirty = true;
+                        }
+                        break;
+                    case 'p': case '[':
+                        if (t.spine > 0) {
+                            ty_chapter(&t, t.spine - 1, 0, 0, -1);
+                            dirty = true;
+                        }
+                        break;
+                    case '+': case '=':
+                        if (t.st.size < 72) { t.st.size += 1; ty_restyle(&t); dirty = true; }
+                        break;
+                    case '-': case '_':
+                        if (t.st.size > 8) { t.st.size -= 1; ty_restyle(&t); dirty = true; }
+                        break;
+                    case 'd': t.paper = !t.paper; ty_restyle(&t); dirty = true; break;
+                    case 'F': ty_font_cycle(&t, +1); ty_restyle(&t); dirty = true; break;
+                    case 'w': t.fill = !t.fill; dirty = true; break;
+                    case 'J': t.st.justify = !t.st.justify; ty_restyle(&t); dirty = true; break;
+                    case 'H':
+                        t.st.hyphenation = t.st.hyphenation > 0 ? 0 : 1;
+                        ty_restyle(&t);
+                        dirty = true;
+                        break;
+                    case '?': help = true; dirty = true; break;
+                    default: break;
+                }
+                break;
+            default: break;
+        }
+
+        if (fwd) {
+            if (t.page + 1 < t.npages) { t.page++; dirty = true; }
+            else if (t.spine < bk.nspine - 1) {
+                ty_chapter(&t, t.spine + 1, 0, 0, +1);
+                dirty = true;
+            }
+        } else if (back) {
+            if (t.page > 0) { t.page--; dirty = true; }
+            else if (t.spine > 0) {
+                /* Back off the top of a chapter and the one before opens at
+                   its end, which is what going back through it means. */
+                ty_chapter(&t, t.spine - 1, 0, 0, -1);
+                t.page = t.npages ? t.npages - 1 : 0;
+                dirty = true;
+            }
+        }
+    }
+
+    int b, o;
+    ty_here(&t, &b, &o);
+    /* The page estimate belongs to the wrapped reader, which measures the
+       whole book; keep whatever it left, and fall back to chapters so a book
+       only ever read here still shows progress in --resume. */
+    if (keep_total <= 0) { keep_page = t.spine + 1; keep_total = bk.nspine; }
+    state_save(path, t.spine, b, o, keep_page, keep_total, 0);
+    ty_conf_save(&t);
+
+    ui_stop(s);
+    if (t.tc) type_close(t.tc);
+    doc_free(&t.doc);
+    epub_close(&bk);
+    return 0;
+}
+
 /* -------------------------------------------------------------- read pdf -- */
 
 /* A PDF is pages of pixels, not text to reflow, so it is read the way cbr
@@ -1146,8 +1626,7 @@ static int read_pdf(const char *path) {
     if (!g_graphics) {
         ui_stop(s);
         pdf_close(doc);
-        fprintf(stderr, "ep: reading a PDF needs a terminal that speaks kitty "
-                        "graphics (kitty, Ghostty)\n");
+        ui_graphics_error("reading a PDF");
         return 1;
     }
 
@@ -1354,18 +1833,22 @@ static int read_pdf(const char *path) {
 
 int main(int argc, char **argv) {
     const char *file = NULL;
-    bool want_dump = false, want_resume = false;
+    bool want_dump = false, want_resume = false, want_type = false;
     int  width = 76;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--dump") || !strcmp(a, "-d")) want_dump = true;
         else if (!strcmp(a, "--resume")) want_resume = true;
+        else if (!strcmp(a, "--typeset")) want_type = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-w") && i + 1 < argc) width = atoi(argv[++i]);
         else if (a[0] != '-') file = a;
         else { usage(); return 2; }
     }
+
+    /* Not for --dump, whose output is the stdout the probe would write to. */
+    if (!want_dump) ui_detect();
 
     char picked[PATH_MAX];
     if (want_resume && !file) {
@@ -1390,5 +1873,6 @@ int main(int argc, char **argv) {
         if (want_dump) { fprintf(stderr, "ep: --dump only works on epubs\n"); return 2; }
         return read_pdf(full);
     }
-    return want_dump ? dump_epub(full, width) : read_epub(full, width);
+    if (want_dump) return dump_epub(full, width);
+    return want_type ? read_typeset(full) : read_epub(full, width);
 }

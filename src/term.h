@@ -117,6 +117,9 @@ void term_set_background_color(uint8_t r, uint8_t g, uint8_t b);
 bool term_query_background_color(uint8_t *r, uint8_t *g, uint8_t *b,
                                  int timeout_ms);
 
+bool term_query_foreground_color(uint8_t *r, uint8_t *g, uint8_t *b,
+                                 int timeout_ms);
+
 bool term_color_is_light(uint8_t r, uint8_t g, uint8_t b);
 
 #endif
@@ -904,16 +907,21 @@ static bool term_parse_hex_channel(const char **p, uint8_t *out) {
     return true;
 }
 
-static bool term_colorfgbg(uint8_t *r, uint8_t *g, uint8_t *b) {
+static bool term_colorfgbg(bool background, uint8_t *r, uint8_t *g, uint8_t *b) {
     const char *v = getenv("COLORFGBG");
     if (!v) return false;
 
-    const char *semi = strrchr(v, ';');
-    if (!semi || !semi[1]) return false;
+    const char *at = background ? strrchr(v, ';') : NULL;
+    if (background) {
+        if (!at || !at[1]) return false;
+        at++;
+    } else {
+        at = v;
+    }
 
     char *end;
-    long idx = strtol(semi + 1, &end, 10);
-    if (end == semi + 1 || idx < 0 || idx > 15) return false;
+    long idx = strtol(at, &end, 10);
+    if (end == at || idx < 0 || idx > 15) return false;
 
     static const uint8_t pal[16][3] = {
         {0,0,0},       {170,0,0},   {0,170,0},   {170,85,0},
@@ -925,27 +933,22 @@ static bool term_colorfgbg(uint8_t *r, uint8_t *g, uint8_t *b) {
     return true;
 }
 
-bool term_query_background_color(uint8_t *r, uint8_t *g, uint8_t *b,
-                                 int timeout_ms) {
-    if (!r || !g || !b) return false;
-
-    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
-        return term_colorfgbg(r, g, b);
-
+/* One question and its answer. The caller supplies the escape because the
+   same question has to be asked two ways under tmux. */
+static bool term_osc_exchange(const char *query, int qlen, uint8_t *r,
+                              uint8_t *g, uint8_t *b, int timeout_ms) {
     struct termios orig;
-    if (tcgetattr(STDIN_FILENO, &orig) == -1) return term_colorfgbg(r, g, b);
+    if (tcgetattr(STDIN_FILENO, &orig) == -1) return false;
 
     struct termios raw = orig;
     raw.c_lflag &= ~(ECHO | ICANON);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
-        return term_colorfgbg(r, g, b);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) return false;
 
-    const char query[] = "\x1b]11;?\x1b\\";
     bool ok = false;
 
-    if (write(STDOUT_FILENO, query, sizeof query - 1) == (ssize_t)(sizeof query - 1)) {
+    if (write(STDOUT_FILENO, query, (size_t)qlen) == (ssize_t)qlen) {
         fflush(stdout);
 
         char buf[256];
@@ -972,7 +975,9 @@ bool term_query_background_color(uint8_t *r, uint8_t *g, uint8_t *b,
             len += (size_t)n;
             buf[len] = '\0';
 
+            /* Most terminals answer rgb:RRRR/GGGG/BBBB; a few use #RRGGBB. */
             const char *rgb = strstr(buf, "rgb:");
+            const char *hash = strchr(buf, '#');
             bool done = memchr(buf, '\a', len) != NULL || strstr(buf, "\x1b\\");
             if (rgb && done) {
                 const char *p = rgb + 4;
@@ -981,12 +986,52 @@ bool term_query_background_color(uint8_t *r, uint8_t *g, uint8_t *b,
                      term_parse_hex_channel(&p, b);
                 break;
             }
+            if (hash && done) {
+                unsigned rr, gg, bb;
+                if (sscanf(hash + 1, "%2x%2x%2x", &rr, &gg, &bb) == 3) {
+                    *r = (uint8_t)rr; *g = (uint8_t)gg; *b = (uint8_t)bb;
+                    ok = true;
+                }
+                break;
+            }
             if (len == sizeof buf - 1) break;
         }
     }
 
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
-    return ok ? true : term_colorfgbg(r, g, b);
+    return ok;
+}
+
+/* OSC 10 is the foreground, OSC 11 the background; the exchange is the same.
+ *
+ * Under tmux the question gets asked twice. tmux answers it itself when it
+ * can, which is the quick way; when it cannot, the query has to travel to the
+ * terminal outside as a passthrough with its ESCs doubled - the treatment
+ * kitty.h gives its graphics escapes, and it needs allow-passthrough set. */
+static bool term_query_osc_color(int osc, uint8_t *r, uint8_t *g, uint8_t *b,
+                                 int timeout_ms) {
+    bool background = osc == 11;
+    if (!r || !g || !b) return false;
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
+        return term_colorfgbg(background, r, g, b);
+
+    char q[64];
+    int n = snprintf(q, sizeof q, "\x1b]%d;?\x1b\\", osc);
+    if (term_osc_exchange(q, n, r, g, b, timeout_ms)) return true;
+
+    if (getenv("TMUX")) {
+        n = snprintf(q, sizeof q, "\x1bPtmux;\x1b\x1b]%d;?\x1b\x1b\\\x1b\\", osc);
+        if (term_osc_exchange(q, n, r, g, b, timeout_ms)) return true;
+    }
+    return term_colorfgbg(background, r, g, b);
+}
+
+bool term_query_background_color(uint8_t *r, uint8_t *g, uint8_t *b, int timeout_ms) {
+    return term_query_osc_color(11, r, g, b, timeout_ms);
+}
+
+bool term_query_foreground_color(uint8_t *r, uint8_t *g, uint8_t *b, int timeout_ms) {
+    return term_query_osc_color(10, r, g, b, timeout_ms);
 }
 
 bool term_poll_event(Term *t, InputEvent *ev, int timeout_ms) {
