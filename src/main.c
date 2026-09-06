@@ -1,9 +1,13 @@
 /**
  * ep - a terminal epub reader
  *
- * One chapter of the spine is laid out at a time into a fixed-width column of
- * wrapped lines; reading position is a (spine, block) pair, so it survives
- * resizing and column-width changes.
+ * A chapter is read one of two ways. By default type.h sets it into pages and
+ * they are drawn as images, which needs macOS and kitty graphics; failing
+ * either, layout.h wraps it onto the character grid instead, and --text asks
+ * for that anyway.
+ *
+ * Both mean the same thing by a reading position - a (spine, block, offset)
+ * triple - so it survives a change of mode, of window size, or of type.
  */
 
 #define _GNU_SOURCE
@@ -94,6 +98,11 @@ typedef struct {
 } Reader;
 
 #define KG_PROBE_MS 300
+
+/* A reader answers with this to be swapped for the other one. The position it
+   saved on the way out is what the next reader opens at, so the swap lands on
+   the same page - the two agree on what a position is. */
+#define EP_SWITCH 3
 
 static bool g_graphics;
 static int  g_cell_w = 10, g_cell_h = 20;
@@ -517,6 +526,7 @@ static const char *HELP[] = {
     "  g / G              chapter start / end",
     "  t                  table of contents",
     "  - / +              narrower / wider column",
+    "  T                  typeset pages",
     "  q                  quit (position is saved)",
 };
 
@@ -815,10 +825,15 @@ static void usage(void) {
         "usage: ep [-w cols] book.epub|book.pdf|dir\n"
         "       ep --resume\n"
         "\n"
-        "  -w cols       text column width (default 76)\n"
         "  --resume      pick from the books you have been reading\n"
+        "  --text        wrap the book onto the character grid instead\n"
+        "  -w cols       column width for --text (default 76)\n"
+        "  --typeset     insist on typeset pages, rather than falling back\n"
         "  --dump        print the book as wrapped text and exit\n"
-        "  --typeset     draw pages with a real typesetter (macOS, prototype)\n"
+        "\n"
+        "Books are typeset into pages, which needs macOS and a terminal that\n"
+        "speaks kitty graphics (kitty, Ghostty); without both, --text is what\n"
+        "you get anyway.\n"
         "\n"
         "A directory is browsed; only epubs, PDFs and directories are listed.\n"
         "PDFs are shown as page images and need a kitty-graphics terminal.\n");
@@ -893,8 +908,18 @@ static bool ui_start(Screen *s) {
         fprintf(stderr, "ep: needs a terminal\n");
         return false;
     }
-    atexit(cleanup);
-    atexit(tmpdir_cleanup);
+    /* Switching readers stops the terminal and starts it again, so the guard
+       that keeps cleanup to once per session is reset here rather than left
+       standing from the session before - otherwise the second reader would
+       exit without putting the terminal back. The handlers themselves are
+       registered once; atexit has no way to take one back. */
+    g_cleaned = false;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        atexit(cleanup);
+        atexit(tmpdir_cleanup);
+    }
     term_install_signal_restore();
     term_enter_alt_screen(&g_tm);
     term_hide_cursor();
@@ -960,7 +985,7 @@ static int read_epub(const char *path, int width) {
     r.page_h = s->height - 1;
     load_chapter(&r, spine, block, off);
 
-    bool running = true, help = false, dirty = true;
+    bool running = true, help = false, dirty = true, switched = false;
     while (running) {
         int page_h = s->height - 1;
         if (page_h < 1) page_h = 1;
@@ -1046,6 +1071,12 @@ static int read_epub(const char *path, int width) {
             case KEY_CHAR:
                 switch (ev.ch) {
                     case 'q': running = false; break;
+                    case 'T':
+                        if (type_available() && g_graphics) {
+                            switched = true;
+                            running = false;
+                        }
+                        break;
                     case 'f': turn_page(&r, +1); break;
                     case 'b': turn_page(&r, -1); break;
                     case 'j': scroll_by(&r, 1, page_h); break;
@@ -1086,7 +1117,7 @@ static int read_epub(const char *path, int width) {
     free(r.cprefix);
     free(r.pg);
     epub_close(&r.book);
-    return 0;
+    return switched ? EP_SWITCH : 0;
 }
 
 /* --------------------------------------------------------- typeset epub -- */
@@ -1102,15 +1133,11 @@ static int read_epub(const char *path, int width) {
 
 /* Used only for a painted page: one asked for, or one forced by a terminal
    that would not say what colours it uses. */
-/* Serif faces that ship with macOS and hold up as book text, roughly in the
-   order they are worth trying. Any that a system turns out not to have is
-   passed over. */
-static const char *TY_FONTS[] = {
-    "Source Serif 4",           /* not a system font; installed, or skipped */
-    "Iowan Old Style", "Charter", "Palatino", "Athelas", "Hoefler Text",
-    "Baskerville", "Georgia", "PT Serif", "STIX Two Text",
-};
-#define TY_NFONTS ((int)(sizeof TY_FONTS / sizeof TY_FONTS[0]))
+/* The book face. Source Serif was drawn for text and holds its colour at the
+   sizes a terminal cell can resolve; where it is not installed, a serif that
+   ships with macOS stands in. */
+#define TY_FONT     "Source Serif 4"
+#define TY_FONT_ALT "Iowan Old Style"
 
 static const uint8_t TY_LIGHT_PAPER[3] = { 0xfa, 0xf7, 0xf0 };
 static const uint8_t TY_LIGHT_INK[3]   = { 0x1c, 0x1a, 0x18 };
@@ -1122,7 +1149,7 @@ typedef struct {
     Doc          doc;
     TypeChapter *tc;
     TypeStyle    st;
-    char         font[128];
+    const char  *font;
     char         initials[PATH_MAX];   /* per-letter fonts for sunk capitals */
     bool         paper;       /* paint a page rather than sit on the terminal */
     bool         fill;        /* fill the pane rather than hold a page shape */
@@ -1167,7 +1194,6 @@ static void ty_conf_load(Ty *t) {
         else if (!strcmp(line, "leading") && atof(sp) >= 1) t->st.leading = atof(sp);
         else if (!strcmp(line, "measure") && atof(sp) >= 12) t->st.measure = atof(sp);
         else if (!strcmp(line, "columns")) t->st.columns = atoi(sp);
-        else if (!strcmp(line, "font") && *sp) snprintf(t->font, sizeof t->font, "%s", sp);
     }
     fclose(f);
 }
@@ -1180,10 +1206,10 @@ static void ty_conf_save(const Ty *t) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "size %.1f\nleading %.2f\nmeasure %.0f\ncolumns %d\npaper %d\n"
-               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nfont %s\n",
+               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\n",
             t->st.size, t->st.leading, t->st.measure, t->st.columns, t->paper,
             t->fill, t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
-            t->st.dropcap, t->font);
+            t->st.dropcap);
     fclose(f);
 }
 
@@ -1196,20 +1222,6 @@ static void ty_conf_save(const Ty *t) {
  *
  * Painting is for asking for something the terminal is not: a cream page on a
    dark theme. That, and a terminal that would not say what its foreground is. */
-/* The next face along that this system actually has. */
-static void ty_font_cycle(Ty *t, int dir) {
-    int at = 0;
-    for (int i = 0; i < TY_NFONTS; i++)
-        if (!strcmp(TY_FONTS[i], t->font)) { at = i; break; }
-    for (int n = 1; n <= TY_NFONTS; n++) {
-        const char *cand = TY_FONTS[((at + dir * n) % TY_NFONTS + TY_NFONTS) % TY_NFONTS];
-        if (type_font_exists(cand)) {
-            snprintf(t->font, sizeof t->font, "%s", cand);
-            return;
-        }
-    }
-}
-
 static void ty_palette(Ty *t) {
     if (!t->paper && t->fg_known) {
         t->st.transparent = true;
@@ -1314,9 +1326,9 @@ static void draw_ty_help(Screen *s) {
         "  n p  or  ] [        next / previous chapter",
         "  + -                 larger / smaller type",
         "  d                   painted page / terminal colours",
-        "  F                   next serif face",
         "  C                   sunk capital at a chapter's opening",
         "  { }                 tighter / looser line spacing",
+        "  T                   wrapped text instead",
         "  1 2 3               columns;  0 fits as many as will read well",
         "  m M                 narrower / wider column",
         "  w                   fill the pane",
@@ -1362,7 +1374,7 @@ static int read_typeset(const char *path) {
     t.bg_light = g_bg_light;
     memcpy(t.term_fg, g_term_fg, 3);
     type_style_default(&t.st);
-    snprintf(t.font, sizeof t.font, "%s", t.st.family);
+    t.font = type_font_exists(TY_FONT) ? TY_FONT : TY_FONT_ALT;
     /* Decorated initials, if any have been put there. */
     char cfgdir[PATH_MAX];
     state_dir(cfgdir, sizeof cfgdir);
@@ -1371,13 +1383,6 @@ static int read_typeset(const char *path) {
     if (stat(t.initials, &ist) != 0 || !S_ISDIR(ist.st_mode)) t.initials[0] = 0;
     t.st.size = g_cell_h * 0.9;
     ty_conf_load(&t);
-    const char *env = getenv("EP_FONT");
-    if (env && *env) snprintf(t.font, sizeof t.font, "%s", env);
-    /* A name nothing answers to would quietly come back as Helvetica. */
-    if (!type_font_exists(t.font)) {
-        t.font[0] = 0;
-        ty_font_cycle(&t, +1);
-    }
 
     int spine = 0, block = 0, off = 0;
     StateLine saved;
@@ -1393,7 +1398,7 @@ static int read_typeset(const char *path) {
 
     uint32_t id = 0, seq = 0;
     bool have = false, running = true, dirty = true, help = false;
-    bool opened = false;
+    bool opened = false, switched = false;
 
     while (running) {
         int box_cols = s->width, box_rows = s->height - 1;
@@ -1480,6 +1485,7 @@ static int read_typeset(const char *path) {
             case KEY_CHAR:
                 switch (ev.ch) {
                     case 'q': running = false; break;
+                    case 'T': switched = true; running = false; break;
                     case 'f': case 'j': fwd = true; break;
                     case 'b': case 'k': back = true; break;
                     case 'g': t.page = 0; dirty = true; break;
@@ -1503,7 +1509,6 @@ static int read_typeset(const char *path) {
                         if (t.st.size > 8) { t.st.size -= 1; ty_restyle(&t); dirty = true; }
                         break;
                     case 'd': t.paper = !t.paper; ty_restyle(&t); dirty = true; break;
-                    case 'F': ty_font_cycle(&t, +1); ty_restyle(&t); dirty = true; break;
                     case 'C': t.st.dropcap = !t.st.dropcap; ty_restyle(&t); dirty = true; break;
                     case '0': case '1': case '2': case '3':
                         t.st.columns = ev.ch - '0';
@@ -1575,7 +1580,7 @@ static int read_typeset(const char *path) {
     if (t.tc) type_close(t.tc);
     doc_free(&t.doc);
     epub_close(&bk);
-    return 0;
+    return switched ? EP_SWITCH : 0;
 }
 
 /* -------------------------------------------------------------- read pdf -- */
@@ -1882,14 +1887,18 @@ static int read_pdf(const char *path) {
 
 int main(int argc, char **argv) {
     const char *file = NULL;
-    bool want_dump = false, want_resume = false, want_type = false;
+    bool want_dump = false, want_resume = false;
+    /* Typeset unless the terminal cannot show it or the reader says otherwise;
+       --typeset then means insist, and say why when it cannot be had. */
+    bool want_text = false, insist_type = false;
     int  width = 76;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--dump") || !strcmp(a, "-d")) want_dump = true;
         else if (!strcmp(a, "--resume")) want_resume = true;
-        else if (!strcmp(a, "--typeset")) want_type = true;
+        else if (!strcmp(a, "--typeset")) insist_type = true;
+        else if (!strcmp(a, "--text") || !strcmp(a, "-t")) want_text = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-w") && i + 1 < argc) width = atoi(argv[++i]);
         else if (a[0] != '-') file = a;
@@ -1923,5 +1932,12 @@ int main(int argc, char **argv) {
         return read_pdf(full);
     }
     if (want_dump) return dump_epub(full, width);
-    return want_type ? read_typeset(full) : read_epub(full, width);
+    if (insist_type) return read_typeset(full);
+
+    bool typeset = !want_text && type_available() && g_graphics;
+    for (;;) {
+        int rc = typeset ? read_typeset(full) : read_epub(full, width);
+        if (rc != EP_SWITCH) return rc;
+        typeset = !typeset;
+    }
 }
