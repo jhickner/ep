@@ -1,6 +1,7 @@
 # ep
 
-A terminal reader for epubs, PDFs and comics.
+A terminal reader for epubs, PDFs and comics, using the kitty graphics
+protocol. Works in tmux. Requires a modern terminal, such as ghostty.
 
 ## Build
 

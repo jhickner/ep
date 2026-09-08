@@ -771,9 +771,10 @@ static int dump(Reader *r) {
 static void usage(void) {
     fprintf(stderr,
         "usage: ep [options] book.epub|book.pdf|comic.cbz|dir ...\n"
-        "       ep --resume\n"
+        "       ep\n"
         "\n"
-        "  --resume      pick from the books you have been reading\n"
+        "  --resume      pick from the books you have been reading, which is\n"
+        "                also what ep does when given nothing to open\n"
         "\n"
         " epubs\n"
         "  --text        wrap the book onto the character grid instead\n"
@@ -1831,15 +1832,19 @@ int main(int argc, char **argv) {
     comic_import_state();
 
     static char picked[PATH_MAX];
-    if (want_resume && !file) {
+    if (!file) {
+        bool implicit = !want_resume;
         int rc = resume_pick(picked, sizeof picked);
-        if (rc < 0) { fprintf(stderr, "ep: nothing to resume yet - read a book first\n"); return 1; }
+        if (rc < 0) {
+            if (implicit) { usage(); return 2; }
+            fprintf(stderr, "ep: nothing to resume yet - read a book first\n");
+            return 1;
+        }
         if (rc > 0) return 0;
         files[0] = picked;
         nfiles = 1;
         file = picked;
     }
-    if (!file) { usage(); return 2; }
 
     struct stat st;
     if (nfiles == 1 && stat(file, &st) == 0 && S_ISDIR(st.st_mode) &&
