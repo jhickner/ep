@@ -23,7 +23,7 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(PDF_FORCE_TOOLS)
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -114,59 +114,192 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
 
 #else
 
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #ifndef IMAGE_H
 #include "image.h"
 #endif
 
+typedef enum { PDF_NONE = 0, PDF_POPPLER, PDF_MUPDF, PDF_GS } PdfTool;
+
 struct PdfDoc {
-    char path[4096];
-    int  pages;
-    double w, h;
+    char    path[PATH_MAX];
+    PdfTool tool;
+    int     pages;
+    double  w, h;
 };
 
-static int pdf_run_int(const char *cmd, const char *key, double *num) {
-    FILE *f = popen(cmd, "r");
-    if (!f) return 0;
-    char line[512];
-    int got = 0;
-    while (fgets(line, sizeof line, f)) {
-        if (strncmp(line, key, strlen(key)) != 0) continue;
-        const char *p = line + strlen(key);
-        while (*p == ' ' || *p == ':') p++;
-        *num = atof(p);
-        got = 1;
-        break;
+static bool pdf_run(char *const argv[], char *out, size_t cap) {
+    int fd[2] = { -1, -1 };
+    if (out && pipe(fd) != 0) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (out) { close(fd[0]); close(fd[1]); }
+        return false;
     }
-    pclose(f);
-    return got;
+    if (pid == 0) {
+        int null = open("/dev/null", O_RDWR);
+        if (out) { dup2(fd[1], 1); close(fd[0]); close(fd[1]); }
+        else if (null >= 0) dup2(null, 1);
+        if (null >= 0) { dup2(null, 2); close(null); }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    if (out) {
+        close(fd[1]);
+        size_t n = 0;
+        ssize_t got;
+        while (n + 1 < cap && (got = read(fd[0], out + n, cap - 1 - n)) > 0)
+            n += (size_t)got;
+        out[n] = '\0';
+        close(fd[0]);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool pdf_field(const char *text, const char *key, double *num) {
+    size_t klen = strlen(key);
+    for (const char *p = text; p && *p; ) {
+        if (!strncmp(p, key, klen)) {
+            const char *v = p + klen;
+            while (*v == ' ' || *v == '\t' || *v == ':') v++;
+            *num = atof(v);
+            return true;
+        }
+        p = strchr(p, '\n');
+        if (p) p++;
+    }
+    return false;
+}
+
+static void pdf_tmp(const PdfDoc *d, char *base, size_t cap) {
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    snprintf(base, cap, "%s/ep-pdf-%d-%p", tmp, (int)getpid(), (const void *)d);
+}
+
+static bool pdf_to_png(const PdfDoc *d, int page, int dpi,
+                       const char *base, char *png, size_t cap) {
+    char r[32], first[32], last[32], out[PATH_MAX];
+    snprintf(r, sizeof r, "%d", dpi);
+    snprintf(first, sizeof first, "-dFirstPage=%d", page + 1);
+    snprintf(last, sizeof last, "-dLastPage=%d", page + 1);
+
+    if (d->tool == PDF_POPPLER) {
+        char f[32], l[32];
+        snprintf(f, sizeof f, "%d", page + 1);
+        snprintf(l, sizeof l, "%d", page + 1);
+        char *argv[] = { (char *)"pdftoppm", (char *)"-png", (char *)"-r", r,
+                         (char *)"-f", f, (char *)"-l", l,
+                         (char *)"-singlefile", (char *)d->path,
+                         (char *)base, NULL };
+        if (!pdf_run(argv, NULL, 0)) return false;
+        snprintf(png, cap, "%s.png", base);
+        return true;
+    }
+
+    snprintf(out, sizeof out, "%s.png", base);
+    if (d->tool == PDF_MUPDF) {
+        char n[32];
+        snprintf(n, sizeof n, "%d", page + 1);
+        char *argv[] = { (char *)"mutool", (char *)"draw",
+                         (char *)"-o", out, (char *)"-r", r,
+                         (char *)d->path, n, NULL };
+        if (!pdf_run(argv, NULL, 0)) return false;
+        snprintf(png, cap, "%s", out);
+        return true;
+    }
+
+    if (d->tool == PDF_GS) {
+        char sout[PATH_MAX + 16], sr[40];
+        snprintf(sout, sizeof sout, "-sOutputFile=%s", out);
+        snprintf(sr, sizeof sr, "-r%d", dpi);
+        char *argv[] = { (char *)"gs", (char *)"-q", (char *)"-dBATCH",
+                         (char *)"-dNOPAUSE", (char *)"-dSAFER",
+                         (char *)"-sDEVICE=png16m", sr, first, last, sout,
+                         (char *)"--", (char *)d->path, NULL };
+        if (!pdf_run(argv, NULL, 0)) return false;
+        snprintf(png, cap, "%s", out);
+        return true;
+    }
+    return false;
+}
+
+static bool pdf_measure(PdfDoc *d) {
+    char base[PATH_MAX], png[PATH_MAX];
+    pdf_tmp(d, base, sizeof base);
+    if (!pdf_to_png(d, 0, 72, base, png, sizeof png)) return false;
+    int w = 0, h = 0;
+    bool ok = image_probe(png, &w, &h) && w > 0 && h > 0;
+    unlink(png);
+    if (ok) { d->w = w; d->h = h; }
+    return ok;
+}
+
+static bool pdf_gs_count_cmd(const char *path, char *out, size_t cap) {
+    char esc[PATH_MAX * 2];
+    size_t n = 0;
+    for (const char *p = path; *p; p++) {
+        if (n + 2 >= sizeof esc) return false;
+        if (*p == '(' || *p == ')' || *p == '\\') esc[n++] = '\\';
+        esc[n++] = *p;
+    }
+    esc[n] = '\0';
+    return (size_t)snprintf(out, cap,
+        "(%s) (r) file runpdfbegin pdfpagecount = quit", esc) < cap;
 }
 
 PdfDoc *pdf_open(const char *path) {
     PdfDoc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
-    snprintf(d->path, sizeof d->path, "%s", path);
-
-    char cmd[8192];
-    snprintf(cmd, sizeof cmd, "pdfinfo '%s' 2>/dev/null", path);
-    double n = 0, w = 0;
-    if (!pdf_run_int(cmd, "Pages", &n)) { free(d); return NULL; }
-    d->pages = (int)n;
-    if (pdf_run_int(cmd, "Page size", &w)) d->w = w;
-
-    FILE *f = popen(cmd, "r");
-    if (f) {
-        char line[512];
-        while (fgets(line, sizeof line, f))
-            if (!strncmp(line, "Page size:", 10)) {
-                double a, b;
-                if (sscanf(line + 10, "%lf x %lf", &a, &b) == 2) { d->w = a; d->h = b; }
-                break;
-            }
-        pclose(f);
+    if ((size_t)snprintf(d->path, sizeof d->path, "%s", path) >= sizeof d->path) {
+        free(d);
+        return NULL;
     }
-    if (d->pages <= 0 || d->w <= 0 || d->h <= 0) { free(d); return NULL; }
+
+    char buf[8192];
+    double n = 0;
+
+    char *info[] = { (char *)"pdfinfo", d->path, NULL };
+    if (pdf_run(info, buf, sizeof buf) && pdf_field(buf, "Pages:", &n) && n > 0) {
+        d->tool  = PDF_POPPLER;
+        d->pages = (int)n;
+        const char *sz = strstr(buf, "Page size:");
+        if (sz) sscanf(sz + 10, "%lf x %lf", &d->w, &d->h);
+    }
+
+    if (!d->tool) {
+        char *mi[] = { (char *)"mutool", (char *)"info", d->path, NULL };
+        if (pdf_run(mi, buf, sizeof buf) && pdf_field(buf, "Pages:", &n) && n > 0) {
+            d->tool  = PDF_MUPDF;
+            d->pages = (int)n;
+        }
+    }
+
+    if (!d->tool) {
+        char ps[PATH_MAX * 2 + 64];
+        if (pdf_gs_count_cmd(d->path, ps, sizeof ps)) {
+            char *gs[] = { (char *)"gs", (char *)"-q", (char *)"-dNODISPLAY",
+                           (char *)"-dBATCH", (char *)"-dNOSAFER",
+                           (char *)"-c", ps, NULL };
+            if (pdf_run(gs, buf, sizeof buf)) {
+                int pages = atoi(buf);
+                if (pages > 0) { d->tool = PDF_GS; d->pages = pages; }
+            }
+        }
+    }
+
+    if (!d->tool) { free(d); return NULL; }
+    if ((d->w <= 0 || d->h <= 0) && !pdf_measure(d)) { free(d); return NULL; }
     return d;
 }
 
@@ -184,13 +317,10 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
                 int out_w, int out_h, uint8_t *rgba) {
     if (!d || page < 0 || page >= d->pages) return false;
 
-    char base[4096], png[4096], cmd[9000];
-    snprintf(base, sizeof base, "/tmp/ep-pdf-%d", (int)getpid());
-    snprintf(cmd, sizeof cmd,
-             "pdftoppm -png -r %d -f %d -l %d -singlefile '%s' '%s' 2>/dev/null",
-             (int)(scale * 72.0 + 0.5), page + 1, page + 1, d->path, base);
-    if (system(cmd) != 0) return false;
-    snprintf(png, sizeof png, "%s.png", base);
+    char base[PATH_MAX], png[PATH_MAX];
+    pdf_tmp(d, base, sizeof base);
+    if (!pdf_to_png(d, page, (int)(scale * 72.0 + 0.5), base, png, sizeof png))
+        return false;
 
     static const uint8_t white[3] = { 255, 255, 255 };
     Image im = {0};
