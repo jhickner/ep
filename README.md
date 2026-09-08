@@ -52,7 +52,8 @@ macOS too, which is how it gets tested.
 ## epub
 
 Uses kitty graphics and CoreText to render by default: drop caps, small caps, hyphenation and
-justification. Press `d` or use `--text` for text mode.
+justification. Press `T` or use `--text` for text mode. `d` toggles light/dark
+mode.
 
 ![a chapter opening](doc/epub.png)
 
