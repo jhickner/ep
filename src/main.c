@@ -34,6 +34,8 @@
 #include "state.h"
 #define PICK_IMPLEMENTATION
 #include "pick.h"
+#define HELP_IMPLEMENTATION
+#include "help.h"
 #include "comic.h"
 #include "pdf.h"
 #include "type.h"
@@ -467,40 +469,22 @@ static void draw_toc(Reader *r, Screen *s) {
     }
 }
 
-static const char *HELP[] = {
-    "  \xe2\x86\x92 / space / f     next page",
-    "  \xe2\x86\x90 / b             previous page",
-    "  j k / \xe2\x86\x91 \xe2\x86\x93         nudge a line",
-    "  n / p              next / previous chapter",
-    "  g / G              chapter start / end",
-    "  t                  table of contents",
-    "  - / +              narrower / wider column",
-    "  s                  status line",
-    "  T                  typeset pages",
-    "  q                  quit (position is saved)",
+static const HelpRow HELP[] = {
+    { "\xe2\x86\x92 / space / f", "next page" },
+    { "\xe2\x86\x90 / b",         "previous page" },
+    { "j k / \xe2\x86\x91 \xe2\x86\x93",   "nudge a line" },
+    { "n / p",           "next / previous chapter" },
+    { "g / G",           "chapter start / end" },
+    { "t",               "table of contents" },
+    { "- / +",           "narrower / wider column" },
+    { "s",               "status line" },
+    { "T",               "typeset pages" },
+    { "q",               "quit (position is saved)" },
 };
 
-static void draw_key_help(Screen *s, const char **rows, int n) {
-    int w = 0;
-    for (int i = 0; i < n; i++) {
-        int cw = u8_cols(rows[i], (int)strlen(rows[i]));
-        if (cw > w) w = cw;
-    }
-    w += 2;
-    int h = n + 2;
-    if (w > s->width || h > s->height) return;
-
-    int x0 = (s->width - w) / 2, y0 = (s->height - h) / 2;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            screen_put(s, x0 + x, y0 + y, ' ', C_FG, C_SEL);
-    screen_print(s, x0 + 2, y0, " Keys ", C_ACC, C_SEL);
-    for (int i = 0; i < n; i++)
-        screen_print(s, x0 + 1, y0 + 1 + i, rows[i], C_FG, C_SEL);
-}
-
 static void draw_help(Screen *s) {
-    draw_key_help(s, HELP, (int)(sizeof HELP / sizeof *HELP));
+    help_draw(s, " Keys ", HELP, (int)(sizeof HELP / sizeof *HELP),
+              C_FG, C_SEL, C_ACC);
 }
 
 static void scroll_by(Reader *r, int delta, int page_h) {
@@ -1233,24 +1217,25 @@ static void draw_ty_status(Screen *s, const Ty *t) {
 }
 
 static void draw_ty_help(Screen *s) {
-    static const char *rows[] = {
-        "  space / f / right   next page",
-        "  b / left            previous page",
-        "  n p  or  ] [        next / previous chapter",
-        "  + -                 larger / smaller type",
-        "  { }                 tighter / looser line spacing",
-        "  1 2 3               columns; 0 fits what reads well",
-        "  m M                 narrower / wider column",
-        "  w                   fill the pane",
-        "  d                   painted page / terminal colours",
-        "  C                   sunk capital",
-        "  J                   justified text",
-        "  H                   hyphenation",
-        "  s                   status line",
-        "  T                   wrapped text instead",
-        "  q                   quit",
+    static const HelpRow rows[] = {
+        { "space / f / right", "next page" },
+        { "b / left",          "previous page" },
+        { "n p  or  ] [",      "next / previous chapter" },
+        { "+ -",               "larger / smaller type" },
+        { "{ }",               "tighter / looser line spacing" },
+        { "1 2 3",             "columns; 0 fits what reads well" },
+        { "m M",               "narrower / wider column" },
+        { "w",                 "fill the pane" },
+        { "d",                 "painted page / terminal colours" },
+        { "C",                 "sunk capital" },
+        { "J",                 "justified text" },
+        { "H",                 "hyphenation" },
+        { "s",                 "status line" },
+        { "T",                 "wrapped text instead" },
+        { "q",                 "quit" },
     };
-    draw_key_help(s, rows, (int)(sizeof rows / sizeof rows[0]));
+    help_draw(s, " Keys ", rows, (int)(sizeof rows / sizeof *rows),
+              C_FG, C_SEL, C_ACC);
 }
 
 static int read_typeset(const char *path) {
@@ -1492,27 +1477,20 @@ typedef struct {
     int fit;
 } PageKey;
 
-static const char *PDF_HELP[] = {
-    "  \xe2\x86\x92 / space / f     next page",
-    "  \xe2\x86\x90 / b             previous page",
-    "  j k / \xe2\x86\x91 \xe2\x86\x93         nudge a line",
-    "  n / p              next / previous sheet",
-    "  w                  fit page / fit width",
-    "  g / G              first / last page",
-    "  123 then enter     go to a page",
-    "  q                  quit (position is saved)",
+static const HelpRow PDF_HELP[] = {
+    { "\xe2\x86\x92 / space / f", "next page" },
+    { "\xe2\x86\x90 / b",         "previous page" },
+    { "j k / \xe2\x86\x91 \xe2\x86\x93",   "nudge a line" },
+    { "n / p",           "next / previous sheet" },
+    { "w",               "fit page / fit width" },
+    { "g / G",           "first / last page" },
+    { "123 then enter",  "go to a page" },
+    { "q",               "quit (position is saved)" },
 };
 
 static void draw_pdf_help(Screen *s) {
-    int n = (int)(sizeof PDF_HELP / sizeof *PDF_HELP);
-    int w = 40, h = n + 2;
-    int x0 = (s->width - w) / 2, y0 = (s->height - h) / 2;
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            screen_put(s, x0 + x, y0 + y, ' ', C_FG, C_SEL);
-    screen_print(s, x0 + 2, y0, " Keys ", C_ACC, C_SEL);
-    for (int i = 0; i < n; i++)
-        screen_print(s, x0 + 1, y0 + 1 + i, PDF_HELP[i], C_FG, C_SEL);
+    help_draw(s, " Keys ", PDF_HELP, (int)(sizeof PDF_HELP / sizeof *PDF_HELP),
+              C_FG, C_SEL, C_ACC);
 }
 
 static void draw_pdf_status(Screen *s, const char *path, int page, int npages,

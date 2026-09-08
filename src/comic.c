@@ -29,6 +29,7 @@
 #include "page.h"
 #define BOOK_IMPLEMENTATION
 #include "book.h"
+#include "help.h"
 #include "state.h"
 #include "comic.h"
 
@@ -643,31 +644,24 @@ static void draw_status(void) {
 }
 
 static void draw_help(void) {
-    static const char *lines[] = {
-        "",
-        "  space / l / →     forward   (next panel in panel mode)",
-        "  b / h / ←         back",
-        "  n / p             next / previous page, always",
-        "  f                 panel mode on/off",
-        "  w                 fit width; j/k scroll",
-        "  g / G             first / last page",
-        "  tab               thumbnails; enter opens the page",
-        "  ] / [             next / previous book",
-        "  + / -             thumbnail size",
-        "  ctrl-l            redraw from scratch",
-        "  ?                 this help",
-        "  q  ctrl-c        quit",
-        "",
-        "  The reading position is remembered per book.",
-        "",
+    static const HelpRow rows[] = {
+        { "space / l / \xe2\x86\x92", "forward (next panel in panel mode)" },
+        { "b / h / \xe2\x86\x90",     "back" },
+        { "n / p",           "next / previous page, always" },
+        { "f",               "panel mode on/off" },
+        { "w",               "fit width; j/k scroll" },
+        { "g / G",           "first / last page" },
+        { "tab",             "thumbnails; enter opens the page" },
+        { "] / [",           "next / previous book" },
+        { "+ / -",           "thumbnail size" },
+        { "ctrl-l",          "redraw from scratch" },
+        { "?",               "this help" },
+        { "q / ctrl-c",      "quit" },
+        { NULL, NULL },
+        { NULL, "The reading position is remembered per book." },
     };
-    int n = (int)(sizeof lines / sizeof *lines);
-    int w = 62, x = (g_scr->width - w) / 2, y = (g_scr->height - n) / 2;
-    if (x < 0 || y < 0) return;
-    for (int i = 0; i < n; i++) {
-        for (int c = 0; c < w; c++) screen_put(g_scr, x + c, y + i, ' ', C_PTXT, C_PANEL);
-        screen_print(g_scr, x, y + i, lines[i], C_PTXT, C_PANEL);
-    }
+    help_draw(g_scr, " Keys ", rows, (int)(sizeof rows / sizeof *rows),
+              C_PTXT, C_PANEL, C_ACC);
 }
 
 static void evict_thumbs(void) {

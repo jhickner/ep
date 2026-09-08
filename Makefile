@@ -13,7 +13,7 @@ BIN  = ep
 SRC  = src/main.c src/pdf.c src/type.c src/comic.c
 DEPS = src/term.h src/screen.h src/kitty.h src/image.h src/stb_image.h \
        src/zip.h src/xml.h src/epub.h src/doc.h src/layout.h src/state.h src/pick.h src/pdf.h \
-       src/type.h src/comic.h src/book.h src/page.h src/panel.h src/cache.h \
+       src/type.h src/comic.h src/help.h src/book.h src/page.h src/panel.h src/cache.h \
        src/diskcache.h
 
 # libjpeg-turbo decodes JPEGs straight out of the DCT at 1/2, 1/4 or 1/8 scale,
