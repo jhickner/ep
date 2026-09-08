@@ -8,27 +8,26 @@
 #endif
 
 typedef struct {
-    const char          *text;   /* borrowed from the block */
+    const char          *text;
     const unsigned char *style;
     int  len;
     int  indent;
     bool center;
-    int  block;      /* source block, -1 for spacing */
-    int  type;       /* BLK_* of the source block */
-    int  img_row;    /* row within an image, -1 for text */
+    int  block;
+    int  type;
+    int  img_row;
     int  img_rows;
 } Line;
 
 typedef struct { Line *lines; int n, cap; } Layout;
 
-/* Height in rows an image block should occupy at this text width. */
 typedef int (*LayoutImgRows)(const Block *b, int width, void *ctx);
 
 Layout layout_doc(const Doc *d, int width, LayoutImgRows img_rows, void *ctx);
 void   layout_free(Layout *l);
 int    u8_cols(const char *s, int len);
 
-#endif /* LAYOUT_H */
+#endif
 
 #ifdef LAYOUT_IMPLEMENTATION
 
@@ -125,4 +124,4 @@ void layout_free(Layout *l) {
     l->n = l->cap = 0;
 }
 
-#endif /* LAYOUT_IMPLEMENTATION */
+#endif

@@ -1,14 +1,3 @@
-/**
- * ep - a terminal epub reader
- *
- * A chapter is read one of two ways. By default type.h sets it into pages and
- * they are drawn as images, which needs macOS and kitty graphics; failing
- * either, layout.h wraps it onto the character grid instead, and --text asks
- * for that anyway.
- *
- * Both mean the same thing by a reading position - a (spine, block, offset)
- * triple - so it survives a change of mode, of window size, or of type.
- */
 
 #define _GNU_SOURCE
 #include <ctype.h>
@@ -46,15 +35,11 @@
 #define PICK_IMPLEMENTATION
 #include "pick.h"
 #include "comic.h"
-#include "pdf.h"    /* implemented in pdf.c: its CoreGraphics headers and
-                       screen.h both want to own the name "Style" */
-#include "type.h"   /* implemented in type.c, for the same reason */
+#include "pdf.h"
+#include "type.h"
 
 #include <time.h>
 
-/* A printed page, near enough: mass-market paperbacks run about this many
-   characters, and counting characters keeps the number stable across window
-   sizes and column widths. */
 #define CHARS_PER_PAGE 2000
 
 #define C_BG   COLOR_DEFAULT_BG
@@ -63,7 +48,6 @@ static const Color C_DIM = { 0x80, 0x82, 0x8a };
 static const Color C_ACC = { 0xc9, 0x8a, 0x2b };
 static const Color C_SEL = { 0x28, 0x2c, 0x38 };
 
-/* An image block's cell rectangle, resolved once per layout. */
 typedef struct {
     int      block;
     uint32_t id;
@@ -76,13 +60,13 @@ typedef struct {
     Epub   book;
     char   path[PATH_MAX];
 
-    int    spine;          /* current chapter */
+    int    spine;
     Doc    doc;
     Layout lay;
-    int    top;            /* first visible line */
+    int    top;
 
-    int    width;          /* preferred text column width */
-    int    cols;           /* width actually used, clamped to the terminal */
+    int    width;
+    int    cols;
     Term  *term;
 
     bool   toc_open;
@@ -91,36 +75,25 @@ typedef struct {
     ImgPlace *img; int nimg;
     int    page_h;
 
-    int   *pg;             /* line each page starts on */
+    int   *pg;
     int    npg;
 
-    int   *cprefix;        /* characters before each chapter */
+    int   *cprefix;
     int    ctotal;
 } Reader;
 
 #define KG_PROBE_MS 300
 
-/* A reader answers with this to be swapped for the other one. The position it
-   saved on the way out is what the next reader opens at, so the swap lands on
-   the same page - the two agree on what a position is. */
 #define EP_SWITCH 3
 
 static bool g_graphics;
-/* comic.c reads these and calls ui_cell_size(); the readers otherwise share
-   nothing but the terminal. */
+
 int g_cell_w = 10, g_cell_h = 20;
 
-/* What the terminal said about its own colours, asked for at the same time as
-   the graphics probe and for the same reason: both read stdin directly. */
 static bool    g_bg_known, g_fg_known, g_bg_light;
 static uint8_t g_term_fg[3];
 static char g_tmpdir[PATH_MAX];
 
-/* ------------------------------------------------------------- progress -- */
-
-/* Chapters are parsed once at open to size the book in characters, which is
-   what turns a position into a page number. The whole of a novel parses in
-   about ten milliseconds, so this is not worth deferring. */
 static void measure_book(Reader *r) {
     r->cprefix = calloc((size_t)r->book.nspine + 1, sizeof *r->cprefix);
     if (!r->cprefix) return;
@@ -154,17 +127,12 @@ static int page_at(const Reader *r, int block) {
     return chars / CHARS_PER_PAGE + 1;
 }
 
-/* The first line at or below `from` that comes from a real block; blank
-   spacers carry no position of their own. */
 static int first_real_line(const Reader *r, int from) {
     for (int i = from < 0 ? 0 : from; i < r->lay.n; i++)
         if (r->lay.lines[i].block >= 0) return i;
     return -1;
 }
 
-/* Byte offset of a line's text within its block. Wrapping changes which
-   offsets start a line, but not the offsets themselves, so this is the part
-   of the position that survives a change of column width. */
 static int line_off(const Reader *r, const Line *ln) {
     if (ln->block < 0 || ln->type != BLK_TEXT || !ln->text) return 0;
     const Block *b = &r->doc.blocks[ln->block];
@@ -172,7 +140,6 @@ static int line_off(const Reader *r, const Line *ln) {
     return (int)(ln->text - b->text);
 }
 
-/* Where the top of the window sits, as a (block, offset) pair. */
 static void top_pos(const Reader *r, int *block, int *off) {
     int i = first_real_line(r, r->top);
     if (i < 0) { *block = 0; *off = 0; return; }
@@ -191,10 +158,6 @@ static void progress_save(Reader *r) {
     state_save(r->path, r->spine, block, off, page_at(r, block), page_total(r), 0);
 }
 
-/* ---------------------------------------------------------------- images -- */
-
-/* Images have to reach image.h as files, so each one is unpacked once into a
-   private temp directory that goes away with the process. */
 typedef struct { char *zip_path; char file[PATH_MAX]; } Extracted;
 static Extracted *g_extracted;
 static int        g_nextracted;
@@ -230,7 +193,7 @@ static void tmpdir_cleanup(void) {
 }
 
 static uint8_t *pad_to_cells(const uint8_t *rgb, int w, int h, int pw, int ph) {
-    uint8_t *out = calloc((size_t)pw * (size_t)ph, 4);   /* alpha 0 = terminal bg */
+    uint8_t *out = calloc((size_t)pw * (size_t)ph, 4);
     if (!out) return NULL;
     int ox = (pw - w) / 2, oy = (ph - h) / 2;
     for (int y = 0; y < h; y++) {
@@ -290,8 +253,6 @@ static int img_rows(const Block *b, int width, void *ctx) {
     return rows;
 }
 
-/* Decode and hand the pixels to the terminal; the cells that show it are
-   written per visible row by draw_line(). */
 static bool img_send(ImgPlace *p) {
     if (p->sent) return true;
     int px_w = p->cols * g_cell_w, px_h = p->rows * g_cell_h;
@@ -308,10 +269,6 @@ static bool img_send(ImgPlace *p) {
     return true;
 }
 
-/* Page breaks are computed once per layout rather than derived from the top
-   line, so that turning back lands on the same boundary it was turned from.
-   A break never falls inside an image, and never strands a heading at the foot
-   of a page; blank lines at a break are swallowed. */
 static void repaginate(Reader *r) {
     free(r->pg);
     r->pg = NULL;
@@ -327,13 +284,8 @@ static void repaginate(Reader *r) {
         if (end < r->lay.n) {
             int e = end;
 
-            /* Back up out of an image that the break would cut in half. Images
-               are laid out no taller than a page, so this always terminates
-               above the break. */
             while (e > i && r->lay.lines[e].type == BLK_IMG && r->lay.lines[e].img_row > 0) e--;
 
-            /* Back up off a heading whose first lines would sit alone at the
-               foot of the page. */
             int b = r->lay.lines[e - 1].block;
             if (b >= 0 && b < r->doc.nblocks && r->doc.blocks[b].heading) {
                 int k = e - 1;
@@ -344,7 +296,7 @@ static void repaginate(Reader *r) {
             if (e > i) end = e;
         }
         i = end;
-        while (i < r->lay.n && r->lay.lines[i].block < 0) i++;   /* blanks */
+        while (i < r->lay.n && r->lay.lines[i].block < 0) i++;
     }
     if (r->npg == 0) {
         r->pg = realloc(r->pg, sizeof *r->pg);
@@ -352,7 +304,6 @@ static void repaginate(Reader *r) {
     }
 }
 
-/* The page `line` sits on. */
 static int page_of(const Reader *r, int line) {
     int p = 0;
     for (int i = 0; i < r->npg && r->pg[i] <= line; i++) p = i;
@@ -369,16 +320,14 @@ static void relayout(Reader *r, int keep_block, int keep_off) {
     repaginate(r);
     r->top = 0;
     if (keep_block > 0 || keep_off > 0) {
-        /* The last line of the block that starts at or before the saved
-           offset - that is the line the offset falls on at this width. */
+
         for (int i = 0; i < r->lay.n; i++) {
             if (r->lay.lines[i].block != keep_block) continue;
             if (line_off(r, &r->lay.lines[i]) > keep_off) break;
             r->top = i;
         }
     }
-    /* Reading always starts at the top of a page, so a resumed or jumped-to
-       position never opens mid-page. */
+
     r->top = r->pg[page_of(r, r->top)];
 }
 
@@ -403,7 +352,6 @@ static void load_chapter(Reader *r, int spine, int block, int off) {
     relayout(r, block, off);
 }
 
-/* Re-wrap at the current width, holding the reader's place. */
 static void relayout_keeping(Reader *r) {
     int block, off;
     top_pos(r, &block, &off);
@@ -421,8 +369,6 @@ static const char *chapter_title(Reader *r) {
     const char *p = strrchr(r->book.spine[r->spine], '/');
     return p ? p + 1 : r->book.spine[r->spine];
 }
-
-/* ------------------------------------------------------------- drawing -- */
 
 static void draw_line(Reader *r, Screen *s, int x, int y, const Line *ln, int maxw) {
     if (ln->type == BLK_RULE) {
@@ -534,8 +480,6 @@ static const char *HELP[] = {
     "  q                  quit (position is saved)",
 };
 
-/* Wide enough for its longest line, measured in columns rather than bytes so
-   the arrows in it are not counted twice. */
 static void draw_key_help(Screen *s, const char **rows, int n) {
     int w = 0;
     for (int i = 0; i < n; i++) {
@@ -559,19 +503,17 @@ static void draw_help(Screen *s) {
     draw_key_help(s, HELP, (int)(sizeof HELP / sizeof *HELP));
 }
 
-/* ---------------------------------------------------------------- input -- */
-
 static void scroll_by(Reader *r, int delta, int page_h) {
     (void)page_h;
     int top = r->top + delta;
 
-    while (top >= r->lay.n) {                 /* run on into later chapters */
+    while (top >= r->lay.n) {
         if (r->spine >= r->book.nspine - 1) { top = r->lay.n - 1; break; }
         int over = top - r->lay.n;
         load_chapter(r, r->spine + 1, 0, 0);
         top = over;
     }
-    while (top < 0) {                         /* and back into earlier ones */
+    while (top < 0) {
         if (r->spine <= 0) { top = 0; break; }
         int under = -top;
         load_chapter(r, r->spine - 1, 0, 0);
@@ -583,9 +525,6 @@ static void scroll_by(Reader *r, int delta, int page_h) {
     r->top = top;
 }
 
-/* One page forward or back, running on into the next or previous chapter. A
-   chapter always begins at its own first page, so nothing is skipped at the
-   join and nothing is shown twice. */
 static void turn_page(Reader *r, int dir) {
     int p = page_of(r, r->top);
     if (dir > 0) {
@@ -593,7 +532,7 @@ static void turn_page(Reader *r, int dir) {
         if (r->spine < r->book.nspine - 1) { load_chapter(r, r->spine + 1, 0, 0); r->top = 0; }
         return;
     }
-    if (r->top > r->pg[p]) { r->top = r->pg[p]; return; }   /* nudged off-grid */
+    if (r->top > r->pg[p]) { r->top = r->pg[p]; return; }
     if (p > 0) { r->top = r->pg[p - 1]; return; }
     if (r->spine > 0) {
         load_chapter(r, r->spine - 1, 0, 0);
@@ -620,8 +559,6 @@ static void goto_toc(Reader *r, int idx) {
     }
 }
 
-/* -------------------------------------------------------------- pickers -- */
-
 static bool is_epub(const char *path) {
     const char *dot = strrchr(path, '.');
     return dot && strcasecmp(dot, ".epub") == 0;
@@ -641,16 +578,12 @@ static bool book_accept(const char *path, const char *name, bool is_dir, void *c
     return is_dir || is_readable_book(path);
 }
 
-/* A directory of page images is a comic, and so something to open rather than
-   descend into. Every other directory is a shelf. */
 static bool book_leaf(const char *path, void *ctx) {
     return comic_leaf(path, ctx);
 }
 
 #define RESUME_MAX 40
 
-/* A typed filter over a picker's rows. Entries that do not match drop out, and
-   what is left is ordered best match first. */
 typedef struct { int idx, score, order; } FilterRow;
 
 static int filter_cmp(const void *x, const void *y) {
@@ -658,7 +591,6 @@ static int filter_cmp(const void *x, const void *y) {
     if (a->score != b->score) return b->score - a->score;
     return a->order - b->order;
 }
-
 
 static void resume_ago(char *out, size_t cap, time_t then, time_t now) {
     if (then <= 0) { snprintf(out, cap, "-"); return; }
@@ -677,15 +609,12 @@ static void resume_ago(char *out, size_t cap, time_t then, time_t now) {
     }
 }
 
-/* Writes the chosen path to `out`. Returns 0 on a pick, 1 if cancelled, -1 if
-   there is nothing to resume. */
 static int resume_pick(char *out, size_t cap) {
     RecentBook *b = malloc(sizeof *b * RESUME_MAX);
     if (!b) return -1;
     int n = state_recent(b, RESUME_MAX);
     if (n == 0) { free(b); return -1; }
 
-    /* With no keyboard to drive the menu, resuming means the newest book. */
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
         snprintf(out, cap, "%s", b[0].path);
         free(b);
@@ -783,7 +712,7 @@ static int resume_pick(char *out, size_t cap) {
             break;
         }
         else if (!filtering && k == 'x' && nview > 0) {
-            /* Forgetting a book drops the place it was left, not the book. */
+
             int idx = view[sel];
             state_forget(b[idx].path);
             memmove(&b[idx], &b[idx + 1], (size_t)(n - idx - 1) * sizeof *b);
@@ -821,8 +750,6 @@ static int resume_pick(char *out, size_t cap) {
     return chosen >= 0 ? 0 : 1;
 }
 
-/* ----------------------------------------------------------------- dump -- */
-
 static int dump(Reader *r) {
     printf("%s — %s\n", r->book.title, r->book.author);
     printf("%d chapters, %d toc entries, cover: %s\n\n",
@@ -840,8 +767,6 @@ static int dump(Reader *r) {
     }
     return 0;
 }
-
-/* ----------------------------------------------------------------- main -- */
 
 static void usage(void) {
     fprintf(stderr,
@@ -898,25 +823,15 @@ static int dump_epub(const char *path, int width) {
     return rc;
 }
 
-/* ------------------------------------------------------------------- ui -- */
-
-/* Everything that has to ask the terminal a question, done once before the
-   terminal is set up. These queries read stdin themselves, and term_init
-   starts a thread that owns it from then on - after that the thread wins the
-   race and the answers come back as keystrokes. */
 static void ui_detect(void) {
     kg_init();
-    kg_sweep_stale_tempfiles(3600);   /* whatever a crash left behind */
+    kg_sweep_stale_tempfiles(3600);
     if (getenv("TMUX") && !kg_tmux_allow_passthrough())
         fprintf(stderr, "ep: warning: could not set tmux allow-passthrough\n");
 
-    /* Under tmux a terminal that stays silent yields -1 rather than 0, because
-       the trick that tells the two apart is one tmux answers itself. What the
-       environment says is the only thing left to go on. */
     int gfx = kg_probe(KG_PROBE_MS);
     if (gfx == -1) gfx = kg_supported() ? 1 : 0;
-    /* EP_FORCE_GFX and EP_CELL stand in for a terminal that cannot answer the
-       probe - a capture harness, mainly. */
+
     g_graphics = gfx > 0 || getenv("EP_FORCE_GFX") != NULL;
 
     uint8_t bg[3];
@@ -941,11 +856,7 @@ static bool ui_start(Screen *s) {
         fprintf(stderr, "ep: needs a terminal\n");
         return false;
     }
-    /* Switching readers stops the terminal and starts it again, so the guard
-       that keeps cleanup to once per session is reset here rather than left
-       standing from the session before - otherwise the second reader would
-       exit without putting the terminal back. The handlers themselves are
-       registered once; atexit has no way to take one back. */
+
     g_cleaned = false;
     static bool registered = false;
     if (!registered) {
@@ -992,8 +903,6 @@ void ui_cell_size(void) {
     }
 }
 
-/* ------------------------------------------------------------ read epub -- */
-
 static int read_epub(const char *path, int width) {
     Reader r = {0};
     r.width = width;
@@ -1030,9 +939,6 @@ static int read_epub(const char *path, int width) {
             int col = r.cols;
             int x0 = (s->width - col) / 2;
 
-            /* A page can be shorter than the window - a break pulled back off
-               an image or a heading leaves the rest of the window empty rather
-               than bleeding the next page's first lines into it. */
             int pnum = page_of(&r, r.top);
             int end  = pnum + 1 < r.npg ? r.pg[pnum + 1] : r.lay.n;
             if (end <= r.top || end > r.top + page_h) end = r.top + page_h;
@@ -1156,22 +1062,9 @@ static int read_epub(const char *path, int width) {
     return switched ? EP_SWITCH : 0;
 }
 
-/* --------------------------------------------------------- typeset epub -- */
-
-/* The typeset reading mode: instead of wrapping a chapter onto the character
-   grid, hand it to type.h and show the pages it draws. A chapter is built once
-   and paginated, so turning either way is a step between pages that are
-   already known - and a page carries the same (block, offset) position the
-   wrapped reader uses, so the two modes can hand a book to each other. */
-
 #define TY_ID_BASE  8192
 #define TY_ID_SLOTS 4
 
-/* Used only for a painted page: one asked for, or one forced by a terminal
-   that would not say what colours it uses. */
-/* The book face. Source Serif was drawn for text and holds its colour at the
-   sizes a terminal cell can resolve; where it is not installed, a serif that
-   ships with macOS stands in. */
 #define TY_FONT     "Source Serif 4"
 #define TY_FONT_ALT "Iowan Old Style"
 
@@ -1186,14 +1079,11 @@ typedef struct {
     TypeChapter *tc;
     TypeStyle    st;
     const char  *font;
-    char         initials[PATH_MAX];   /* per-letter fonts for sunk capitals */
-    bool         paper;       /* paint a page rather than sit on the terminal */
-    bool         footer;      /* keep a status line at the foot */
-    bool         fill;        /* fill the pane rather than hold a page shape */
+    char         initials[PATH_MAX];
+    bool         paper;
+    bool         footer;
+    bool         fill;
 
-    /* What the terminal said about its own colours. The background is only
-       wanted for its polarity - whether a page can sit on it - since a page
-       that does sit on it is drawn clear rather than painted to match. */
     bool         bg_known, fg_known;
     bool         bg_light;
     uint8_t      term_fg[3];
@@ -1201,8 +1091,6 @@ typedef struct {
     int          spine, page, npages;
     int          cols, rows, w, h;
 } Ty;
-
-/* -------- settings, kept beside the reading history in ~/.config/ep -------- */
 
 static void ty_conf_path(char *out, size_t n) {
     char dir[PATH_MAX];
@@ -1253,15 +1141,6 @@ static void ty_conf_save(const Ty *t) {
     fclose(f);
 }
 
-/* A page reads as part of the window rather than a slide laid over it, so by
-   default nothing is painted at all: the paper is left clear and what shows
-   through is the terminal's own background - exactly, with no colour to get
-   wrong, and still exact after a theme change, through transparency or over a
-   background image. The ink is the terminal's foreground, which contrasts with
-   that background by construction, so the background never has to be known.
- *
- * Painting is for asking for something the terminal is not: a cream page on a
-   dark theme. That, and a terminal that would not say what its foreground is. */
 static void ty_palette(Ty *t) {
     if (!t->paper && t->fg_known) {
         t->st.transparent = true;
@@ -1274,8 +1153,6 @@ static void ty_palette(Ty *t) {
     memcpy(t->st.paper, light ? TY_LIGHT_PAPER : TY_DARK_PAPER, 3);
     memcpy(t->st.ink,   light ? TY_LIGHT_INK   : TY_DARK_INK,   3);
 }
-
-/* ------------------------------------------------------------- chapters -- */
 
 static const char *ty_title(const Epub *bk, int spine) {
     for (int i = 0; i < bk->ntoc; i++)
@@ -1298,7 +1175,6 @@ static Doc ty_parse(Epub *bk, int spine) {
     return d;
 }
 
-/* Build and paginate the current chapter, opening at (block, off). */
 static void ty_build(Ty *t, int block, int off) {
     if (t->tc) { type_close(t->tc); t->tc = NULL; }
     t->st.family   = t->font;
@@ -1310,9 +1186,6 @@ static void ty_build(Ty *t, int block, int off) {
     t->page   = t->npages ? type_page_of(t->tc, block, off) : 0;
 }
 
-/* Move to a chapter, opening at (block, off). A chapter that sets no pages -
-   one that is nothing but a cover image, say - is stepped over in whichever
-   direction the reader was already going. */
 static void ty_chapter(Ty *t, int spine, int block, int off, int dir) {
     while (spine >= 0 && spine < t->bk->nspine) {
         doc_free(&t->doc);
@@ -1323,10 +1196,9 @@ static void ty_chapter(Ty *t, int spine, int block, int off, int dir) {
         spine += dir;
         block = off = 0;
     }
-    /* Nothing further to show; stay where the last attempt left us. */
+
 }
 
-/* Where the reader is, which is what survives a change of size or style. */
 static void ty_here(const Ty *t, int *block, int *off) {
     *block = 0;
     *off   = 0;
@@ -1410,7 +1282,7 @@ static int read_typeset(const char *path) {
     memcpy(t.term_fg, g_term_fg, 3);
     type_style_default(&t.st);
     t.font = type_font_exists(TY_FONT) ? TY_FONT : TY_FONT_ALT;
-    /* Decorated initials, if any have been put there. */
+
     char cfgdir[PATH_MAX];
     state_dir(cfgdir, sizeof cfgdir);
     snprintf(t.initials, sizeof t.initials, "%s/initials", cfgdir);
@@ -1436,14 +1308,11 @@ static int read_typeset(const char *path) {
     bool opened = false, switched = false;
 
     while (running) {
-        /* Without a status line the page has the window to itself. */
+
         int box_cols = s->width, box_rows = s->height - (t.footer ? 1 : 0);
 
         if (dirty && box_cols >= 8 && box_rows >= 4) {
-            /* A page shaped like a page: the column is sized off the window's
-               height so the measure stays readable on a wide terminal. Filling
-               the pane gives that up for the room, which is what a narrow
-               window or a split wants. */
+
             int rows = box_rows;
             int cols = box_cols;
             if (!t.fill) {
@@ -1466,9 +1335,7 @@ static int read_typeset(const char *path) {
 
             uint8_t *px = malloc((size_t)w * (size_t)h * 4);
             if (px && type_draw(t.tc, t.page, px)) {
-                /* Rotating slots retires the old placement and, because the id
-                   rides in the cell's colour, makes the cells themselves
-                   differ - which is what gets them redrawn. */
+
                 uint32_t slot = TY_ID_BASE + (seq++ % TY_ID_SLOTS);
                 kg_delete(slot);
                 kg_transmit_ex(slot, px, w, h, 4);
@@ -1552,10 +1419,10 @@ static int read_typeset(const char *path) {
                         ty_restyle(&t);
                         dirty = true;
                         break;
-                    case 'm':      /* narrower measure */
+                    case 'm':
                         if (t.st.measure > 20) { t.st.measure -= 2; ty_restyle(&t); dirty = true; }
                         break;
-                    case 'M':      /* wider */
+                    case 'M':
                         if (t.st.measure < 60) { t.st.measure += 2; ty_restyle(&t); dirty = true; }
                         break;
                     case '{':
@@ -1595,8 +1462,7 @@ static int read_typeset(const char *path) {
         } else if (back) {
             if (t.page > 0) { t.page--; dirty = true; }
             else if (t.spine > 0) {
-                /* Back off the top of a chapter and the one before opens at
-                   its end, which is what going back through it means. */
+
                 ty_chapter(&t, t.spine - 1, 0, 0, -1);
                 t.page = t.npages ? t.npages - 1 : 0;
                 dirty = true;
@@ -1606,9 +1472,7 @@ static int read_typeset(const char *path) {
 
     int b, o;
     ty_here(&t, &b, &o);
-    /* The page estimate belongs to the wrapped reader, which measures the
-       whole book; keep whatever it left, and fall back to chapters so a book
-       only ever read here still shows progress in --resume. */
+
     if (keep_total <= 0) { keep_page = t.spine + 1; keep_total = bk.nspine; }
     state_save(path, t.spine, b, o, keep_page, keep_total, 0);
     ty_conf_save(&t);
@@ -1619,12 +1483,6 @@ static int read_typeset(const char *path) {
     epub_close(&bk);
     return switched ? EP_SWITCH : 0;
 }
-
-/* -------------------------------------------------------------- read pdf -- */
-
-/* A PDF is pages of pixels, not text to reflow, so it is read the way cbr
-   reads a comic: the page fitted to the window, or fitted to its width and
-   scrolled, which is the only way body text is legible in a terminal. */
 
 typedef enum { FIT_PAGE = 0, FIT_WIDTH = 1 } Fit;
 
@@ -1679,7 +1537,6 @@ static void draw_pdf_status(Screen *s, const char *path, int page, int npages,
     screen_print(s, s->width - rw - 1, y, right, *jump ? C_ACC : C_DIM, C_BG);
 }
 
-/* How far a width-fitted page can scroll before its foot is on screen. */
 static int pdf_max_scroll(PdfDoc *doc, int page, int cols, int rows) {
     double pw, ph;
     if (!pdf_page_size(doc, page, &pw, &ph) || pw <= 0) return 0;
@@ -1701,8 +1558,7 @@ static int read_pdf(const char *path) {
     int npages = pdf_pages(doc);
 
     int page = 0, scroll = 0;
-    /* A wheel notch is a small nudge, so a whole page only turns after a few
-       of them; width-fitted pages just scroll by lines instead. */
+
     const int WHEEL_PER_PAGE = 3;
     int wheel = 0;
     Fit fit = FIT_PAGE;
@@ -1772,9 +1628,7 @@ static int read_pdf(const char *path) {
                 int w = cols * g_cell_w, h = rows * g_cell_h;
                 uint8_t *px = malloc((size_t)w * (size_t)h * 4);
                 if (px && pdf_render(doc, page, scale, off_x, off_y, w, h, px)) {
-                    /* Rotating slots retires the old placement and, because the
-                       id rides in the cell's colour, makes the cells themselves
-                       differ - which is what gets them redrawn. */
+
                     uint32_t next = PDF_ID_BASE + (seq++ % PDF_ID_SLOTS);
                     kg_delete(next);
                     kg_transmit_ex(next, px, w, h, 4);
@@ -1822,15 +1676,11 @@ static int read_pdf(const char *path) {
         }
 
         int line = g_cell_h;
-        /* A turn moves a whole window, so nothing is shown twice and the bands
-           of a page read like pages of their own. */
+
         int win  = box_rows * g_cell_h;
         if (win < line) win = line;
         int maxs = fit == FIT_WIDTH ? pdf_max_scroll(doc, page, box_cols, box_rows) : 0;
 
-        /* Bands sit on a fixed grid down the sheet, with the last one resting
-           against its foot, so turning back retraces the same boundaries the
-           way forward crossed them. */
         int fwd = ((scroll / win) + 1) * win;
         if (fwd > maxs) fwd = maxs;
         int back = (((scroll + win - 1) / win) - 1) * win;
@@ -1918,8 +1768,7 @@ static int read_pdf(const char *path) {
         if (fit != FIT_WIDTH) {
             scroll = 0;
         } else {
-            /* Scrolling off either end of a page carries on into the next one,
-               so a long document reads as one continuous strip. */
+
             if (scroll < 0) {
                 if (page > 0) { page--; scroll = pdf_max_scroll(doc, page, box_cols, box_rows); }
                 else scroll = 0;
@@ -1937,8 +1786,6 @@ static int read_pdf(const char *path) {
     return 0;
 }
 
-/* ----------------------------------------------------------- read comic -- */
-
 static int read_comic(char **paths, int npaths, const ComicOpts *o) {
     if (!g_graphics) { ui_graphics_error("comics"); return 1; }
 
@@ -1950,22 +1797,16 @@ static int read_comic(char **paths, int npaths, const ComicOpts *o) {
     return rc;
 }
 
-/* ----------------------------------------------------------------- main -- */
-
 int main(int argc, char **argv) {
     const char *file = NULL;
     char **files = NULL;
     int    nfiles = 0;
     ComicOpts comic = {0};
     bool want_dump = false, want_resume = false;
-    /* Typeset unless the terminal cannot show it or the reader says otherwise;
-       --typeset then means insist, and say why when it cannot be had. */
+
     bool want_text = false, insist_type = false;
     int  width = 76;
 
-    /* Paths are collected rather than taken one at a time: ] and [ move
-       between the comics named on the command line. The other readers take
-       one book, and use the first. */
     files = calloc((size_t)argc, sizeof *files);
     if (!files) return 1;
 
@@ -1977,8 +1818,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--text") || !strcmp(a, "-t")) want_text = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-f")) { comic.panel_mode = true; comic.forced = true; }
-        /* -w is the text column width when a number follows it, and otherwise
-           the comic reader's fit-width. The two never apply to one file. */
+
         else if (!strcmp(a, "-w") && i + 1 < argc && isdigit((unsigned char)argv[i + 1][0]))
             width = atoi(argv[++i]);
         else if (!strcmp(a, "-w")) { comic.fit_width = true; comic.forced = true; }
@@ -1987,7 +1827,6 @@ int main(int argc, char **argv) {
     }
     file = nfiles ? files[0] : NULL;
 
-    /* Not for --dump, whose output is the stdout the probe would write to. */
     if (!want_dump) ui_detect();
     comic_import_state();
 
@@ -1995,15 +1834,13 @@ int main(int argc, char **argv) {
     if (want_resume && !file) {
         int rc = resume_pick(picked, sizeof picked);
         if (rc < 0) { fprintf(stderr, "ep: nothing to resume yet - read a book first\n"); return 1; }
-        if (rc > 0) return 0;                       /* cancelled */
+        if (rc > 0) return 0;
         files[0] = picked;
         nfiles = 1;
         file = picked;
     }
     if (!file) { usage(); return 2; }
 
-    /* A directory holding page images is a comic and opens as one; anything
-       else is a shelf to look inside. */
     struct stat st;
     if (nfiles == 1 && stat(file, &st) == 0 && S_ISDIR(st.st_mode) &&
         !(comic_dir_is_book(file) && !comic_dir_is_shelf(file))) {

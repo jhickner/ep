@@ -1,5 +1,4 @@
-// Renders typeset pages of an epub chapter to PPMs, for checking type.h by eye.
-//   typeshot book.epub spine npages w h size out-prefix
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,8 +68,7 @@ int main(int argc, char **argv) {
         if (!type_draw(tc, i, px)) { fprintf(stderr, "draw failed\n"); return 1; }
         char out[512];
         snprintf(out, sizeof out, "%s%d.ppm", prefix, i);
-        // PPM has no alpha, so a transparent page is composited over the
-        // colour a terminal would show behind it (EP_OVER, default dark).
+
         unsigned o0 = 0x1d, o1 = 0x1f, o2 = 0x21;
         if (getenv("EP_OVER")) sscanf(getenv("EP_OVER"), "%2x%2x%2x", &o0, &o1, &o2);
         long clear = 0;
@@ -92,7 +90,6 @@ int main(int argc, char **argv) {
             fprintf(stderr, "page %d: %.1f%% fully clear\n", i, 100.0 * clear / (w * h));
     }
 
-    // every page start must name the page it came from
     for (int i = 0; i < total; i++) {
         int block, off;
         type_page_start(tc, i, &block, &off);

@@ -1,16 +1,3 @@
-/**
- * comic.c - comic.h's implementation.
- *
- * Page view shows one page fitted to the window. Panel mode walks the page's
- * panels instead, one filling the window at a time, and runs on into the next
- * page when it reaches the end of this one. Thumbs is a grid of the whole
- * book to jump around in.
- *
- * Its own translation unit so that a view, a fit and a page cache stay out of
- * main.c, which already holds two other readers. term.h, screen.h, kitty.h and
- * image.h are implemented over there; only the modules nothing else uses are
- * implemented here.
- */
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -45,31 +32,25 @@
 #include "state.h"
 #include "comic.h"
 
-/* The host owns the terminal and what it said about its cell size. */
 extern int g_cell_w, g_cell_h;
 void ui_cell_size(void);
-
-/* --------------------------------------------------------------- theme -- */
 
 #define C_BG COLOR_DEFAULT_BG
 #define C_FG COLOR_DEFAULT_FG
 
 static const Color C_DIM   = { 0x82, 0x88, 0x94 };
 static const Color C_SEL   = { 0x7a, 0xa2, 0xf7 };
-static const Color C_PANEL = { 0x1b, 0x1d, 0x25 };   // help overlay only
+static const Color C_PANEL = { 0x1b, 0x1d, 0x25 };
 static const Color C_PTXT  = { 0xc8, 0xcc, 0xd4 };
 static const Color C_ACC   = { 0xc9, 0x8a, 0x2b };
 static const Color C_ERR   = { 0xd6, 0x45, 0x5f };
 
-// Pages are composited onto this before scaling, and letterboxed against it.
 static const uint8_t BG_RGB[3] = { 0x11, 0x12, 0x16 };
-
-/* --------------------------------------------------------------- state -- */
 
 typedef enum { VIEW_PAGE = 0, VIEW_THUMBS } View;
 typedef enum { FIT_PAGE = 0, FIT_WIDTH } Fit;
 
-static char **g_books;                 // archive/directory paths from argv
+static char **g_books;
 static int    g_nbooks, g_book_idx;
 
 static Book       g_book;
@@ -77,14 +58,14 @@ static PageStore  g_pages;
 static Cache      g_thumbs;
 static bool       g_thumbs_ready;
 
-static int  g_page;                    // page being read
-static int  g_panel;                   // panel within it, when panel mode is on
+static int  g_page;
+static int  g_panel;
 static bool g_panel_mode;
-static bool g_mode_forced;             // -f or -w given, so the saved mode is not applied
+static bool g_mode_forced;
 static View g_view = VIEW_PAGE;
 static Fit  g_fit = FIT_PAGE;
-static int  g_scroll;                  // top of the window in page pixels, FIT_WIDTH
-static int  g_thumb_size = 12;         // thumbnail width in cells
+static int  g_scroll;
+static int  g_thumb_size = 12;
 static int  g_thumb_scroll;
 static bool g_show_help;
 static char g_status[256];
@@ -92,16 +73,9 @@ static char g_status[256];
 static Term   *g_tty;
 static Screen *g_scr;
 
-// A page is decoded no larger than this on the long edge. Panel mode crops out
-// of the same buffer, so this is also the resolution a panel is enlarged from -
-// low enough to keep a handful of pages in memory, high enough that a sixth of
-// a page still fills a window.
 #define PAGE_MAX_DIM 3000
 #define PAGE_SLOTS   5
 
-// Ids the terminal knows our images by. The main view rotates through a few so
-// that replacing the picture never repaints cells still naming the old one, and
-// every byte is non-zero so tmux cannot mistake one for a palette index.
 #define MAIN_ID_BASE   0x00B14100u
 #define MAIN_ID_SLOTS  4
 #define THUMB_ID_BASE  0x00C25000u
@@ -109,18 +83,13 @@ static Screen *g_scr;
 
 #define KG_PROBE_MS 300
 
-// Both caches are rebuildable, so they are held to a size rather than kept.
-// An unpacked book runs to tens of megabytes, a thumbnail to a few kilobytes.
 #define BOOK_CACHE_BUDGET  (2048ull * 1024 * 1024)
 #define THUMB_CACHE_BUDGET (256u   * 1024 * 1024)
 
-// ctrl-c. The terminal is in raw mode, so it is delivered rather than signalled.
 #define KEY_INTR 0x03
 
 static uint32_t g_main_id;
 static unsigned g_main_seq;
-
-/* ---------------------------------------------------------- placements -- */
 
 typedef struct { uint32_t id; int col, row, cols, rows; } Place;
 
@@ -138,9 +107,6 @@ static void push_place(uint32_t id, int col, int row, int cols, int rows) {
     g_places[g_nplaces++] = (Place){ id, col, row, cols, rows };
 }
 
-// Declare this frame's placement rectangles, then write the placeholder cells
-// that make them visible. From here on the images are just cells: anything
-// drawn afterwards covers them, and screen.h's diffing decides what to redraw.
 static void stamp_placeholders(void) {
     bool changed = (g_nplaces != g_nprev_places) ||
                    memcmp(g_places, g_prev_places, (size_t)g_nplaces * sizeof(Place)) != 0;
@@ -158,12 +124,10 @@ static void stamp_placeholders(void) {
     }
 }
 
-/* --------------------------------------------------------------- pixels -- */
-
 static uint8_t *pad_to_cells(const uint8_t *rgb, int w, int h,
                              int ox, int oy, int pw, int ph) {
     if (pw <= 0 || ph <= 0) return NULL;
-    uint8_t *out = (uint8_t *)calloc((size_t)pw * (size_t)ph, 4);   // alpha 0
+    uint8_t *out = (uint8_t *)calloc((size_t)pw * (size_t)ph, 4);
     if (!out) return NULL;
     for (int y = 0; y < h; y++) {
         int dy = oy + y;
@@ -182,7 +146,6 @@ static uint8_t *pad_to_cells(const uint8_t *rgb, int w, int h,
     return out;
 }
 
-// Lift `crop` out of `src` and resample it to dw x dh in one step.
 static uint8_t *crop_scale(const uint8_t *src, int sw, int sh,
                            int cx, int cy, int cw, int ch, int dw, int dh) {
     if (cx < 0) cx = 0;
@@ -212,12 +175,8 @@ static uint8_t *crop_scale(const uint8_t *src, int sw, int sh,
     return out;
 }
 
-/* ------------------------------------------------------------- reading -- */
-
 static int npages(void) { return g_book.npages; }
 
-// The panels of the current page, or a single region covering it while the
-// page is still decoding.
 static int page_panel_count(int page) {
     const Panel *p = NULL;
     int n = 0, w, h;
@@ -236,14 +195,11 @@ static void goto_page(int page, bool from_end) {
     if (page < 0 || page >= npages()) return;
     g_page = page;
     g_scroll = from_end ? INT_MAX : 0;
-    // The panel count is only known once the page is decoded; landing on the
-    // last panel of a page walked into backwards is resolved in draw_page().
+
     g_panel = from_end ? INT_MAX : 0;
     pages_set_focus(&g_pages, g_page);
 }
 
-// One step forward: the next panel, else the next page. Panel mode is the only
-// thing that makes this different from turning the page.
 static void step_forward(void) {
     if (g_panel_mode) {
         int n = page_panel_count(g_page);
@@ -257,16 +213,6 @@ static void step_back(void) {
     if (g_page > 0) goto_page(g_page - 1, true);
 }
 
-/* ---------------------------------------------------------- saved place -- */
-
-/* The store in state.h is shared with the other readers. Its (spine, block)
-   pair is whatever a reader means by a position, and for a comic that is the
-   page and the panel within it. */
-
-/* The mode a book was being read in, kept with its place so that reopening it
-   returns to the view it was left in. Bits, not a choice of one: panel mode is
-   what the page view falls back out of, and it falls back to the fit that was
-   underneath it. */
 #define MODE_PANEL 1
 #define MODE_WIDTH 2
 
@@ -284,10 +230,6 @@ static void save_place(void) {
                g_page + 1, g_book.npages, reading_mode());
 }
 
-/* Comics were read by a program of their own until they were folded in here,
-   and its store had the same fields in a different order. Taking them over
-   once means a library keeps its places; the marker is what stops it being
-   taken over again, over places since moved on. */
 void comic_import_state(void) {
     const char *home = getenv("HOME");
     if (!home) return;
@@ -303,8 +245,6 @@ void comic_import_state(void) {
     FILE *f = fopen(old, "r");
     if (!f) return;
 
-    /* Oldest first, so that rewriting the store one line at a time leaves them
-       in the order they were read. */
     char (*lines)[PATH_MAX + 64] = malloc(sizeof(*lines) * 500);
     int n = 0;
     if (lines) while (n < 500 && fgets(lines[n], sizeof lines[0], f)) n++;
@@ -340,18 +280,11 @@ void comic_import_state(void) {
     if (m) fclose(m);
 }
 
-/* -------------------------------------------------------------- browse -- */
-
-// A directory given on the command line is browsed rather than read, since a
-// shelf of comics is a directory and so is a comic unpacked into one.
-
 bool comic_accept(const char *path, const char *name, bool is_dir, void *ctx) {
     (void)name; (void)ctx;
     return is_dir || book_is_comic(path);
 }
 
-// True if `dir` holds page images directly, and so is a book in its own right
-// rather than a shelf to look inside.
 bool comic_dir_is_book(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return false;
@@ -363,8 +296,6 @@ bool comic_dir_is_book(const char *dir) {
     return found;
 }
 
-// True if `dir` directly holds a comic or a page image - enough to make it
-// worth listing as somewhere to go.
 static bool browse_has_content(const char *dir) {
     DIR *d = opendir(dir);
     if (!d) return false;
@@ -378,11 +309,6 @@ static bool browse_has_content(const char *dir) {
     return any;
 }
 
-// Whether a directory is a shelf to look inside or a book to read. A comic in
-// it settles the question. Failing that, page images make it a book - unless a
-// subdirectory holds comics or pages of its own, which is what tells a folder
-// of comics with loose images dropped in it from a comic unpacked into a folder
-// with a stray __MACOSX beside the pages.
 #define BROWSE_LOOKAHEAD 64
 
 bool comic_dir_is_shelf(const char *dir) {
@@ -416,17 +342,14 @@ bool comic_dir_is_shelf(const char *dir) {
     return shelf;
 }
 
-// A folder of pages is a book; a shelf is something to look inside.
 bool comic_leaf(const char *path, void *ctx) {
     (void)ctx;
     return comic_dir_is_book(path) && !comic_dir_is_shelf(path);
 }
 
-/* --------------------------------------------------------------- books -- */
-
 static void drop_terminal_images(void) {
     kg_delete_all();
-    g_nprev_places = -1;       // every placement was just destroyed
+    g_nprev_places = -1;
     g_main_id = 0;
 }
 
@@ -454,10 +377,6 @@ static bool open_book(int idx) {
     g_panel = 0;
     g_scroll = 0;
 
-    // A mode named on the command line is meant for every book opened in this
-    // run; otherwise each book comes back in the mode, and at the panel, it was
-    // left in. The panel is clamped once the page is decoded and its panels are
-    // known, which is where every other bound on it is applied too.
     StateLine at;
     bool known = state_lookup(g_book.path, &at);
     g_page = known ? at.spine : 0;
@@ -471,11 +390,6 @@ static bool open_book(int idx) {
     return true;
 }
 
-/* ------------------------------------------------------------ page view -- */
-
-// What the main image currently on the terminal depicts. Rebuilding it costs a
-// resample of a multi-megapixel page and a megabyte over the wire, so it is
-// only done when one of these changes.
 typedef struct {
     int page, panel, fit, scroll;
     int cols, rows, cell_w, cell_h;
@@ -487,12 +401,8 @@ static bool    g_have_shown;
 
 static void invalidate_main(void) { g_have_shown = false; }
 
-// Decode-and-place the page (or panel) into the given cell box. Returns false
-// when there is nothing to show yet.
 static bool stage_main(int box_x, int box_y, int box_cw, int box_ch) {
-    // Placeholder cells name their row and column through a diacritic table
-    // that runs out at kg_max_rowcolumn(); a larger box has cells it cannot
-    // name. Only a very large window reaches this.
+
     int lim = kg_max_rowcolumn() + 1;
     if (box_cw > lim) { box_x += (box_cw - lim) / 2; box_cw = lim; }
     if (box_ch > lim) { box_y += (box_ch - lim) / 2; box_ch = lim; }
@@ -503,8 +413,6 @@ static bool stage_main(int box_x, int box_y, int box_cw, int box_ch) {
     const uint8_t *rgb = pages_borrow(&g_pages, g_page, &pw, &ph, &panels, &np);
     if (!rgb) return false;
 
-    // Panel indices are only meaningful once the page is here, so a page
-    // entered backwards resolves its "last panel" now.
     if (g_panel_mode && np > 0) {
         if (g_panel >= np) g_panel = np - 1;
         if (g_panel < 0) g_panel = 0;
@@ -515,7 +423,7 @@ static bool stage_main(int box_x, int box_y, int box_cw, int box_ch) {
         cx = panels[g_panel].x; cy = panels[g_panel].y;
         cw = panels[g_panel].w; ch = panels[g_panel].h;
     } else if (g_fit == FIT_WIDTH) {
-        // Show the full width and as much height as the window's shape allows.
+
         ch = (int)((int64_t)pw * (box_ch * g_cell_h) / (box_cw * g_cell_w));
         if (ch > ph) ch = ph;
         if (g_scroll > ph - ch) g_scroll = ph - ch;
@@ -552,7 +460,7 @@ static bool stage_main(int box_x, int box_y, int box_cw, int box_ch) {
         if (!padded) { pages_release(&g_pages, g_page); return false; }
 
         uint32_t id = MAIN_ID_BASE + (g_main_seq++ % MAIN_ID_SLOTS);
-        kg_delete(id);          // whatever this slot held a few turns ago
+        kg_delete(id);
         kg_transmit_ex(id, padded, cols * g_cell_w, rows * g_cell_h, 4);
         free(padded);
         g_main_id = id;
@@ -574,8 +482,6 @@ static void draw_page(void) {
     int box_cw = g_scr->width, box_ch = g_scr->height - 1;
     if (box_cw < 2 || box_ch < 2 || !npages()) return;
 
-    // The page being read first, then its neighbours: pages_want is also where
-    // eviction happens, so the order here is the order they are kept in.
     pages_want(&g_pages, g_page);
     pages_want(&g_pages, g_page + 1);
     pages_want(&g_pages, g_page - 1);
@@ -589,15 +495,12 @@ static void draw_page(void) {
     }
 }
 
-/* ---------------------------------------------------------- thumb view -- */
-
 typedef struct { int cols, rows, tw, th, ow, oh, x0; } Geom;
 
 static Geom thumb_geom(void) {
     Geom g;
     g.tw = g_thumb_size;
-    // Comic pages are taller than they are wide; keep the tile the same shape
-    // so a page fills it rather than floating in it.
+
     g.th = (int)((double)g.tw * g_cell_w * 1.5 / g_cell_h) + 1;
     g.ow = g.tw + 2;
     g.oh = g.th + 3;
@@ -697,14 +600,11 @@ static void draw_thumbs(void) {
         }
     }
 
-    // A row either side, so ordinary scrolling arrives at pages already decoded.
     for (int i = first - g.cols; i < last + g.cols; i++) {
         if (i < 0 || i >= npages() || (i >= first && i < last)) continue;
         cache_request(&g_thumbs, i, g_book.pages[i], px_w, px_h);
     }
 }
-
-/* -------------------------------------------------------------- chrome -- */
 
 static void draw_status(void) {
     int y = g_scr->height - 1;
@@ -733,8 +633,6 @@ static void draw_status(void) {
         if (x < g_scr->width - 4) screen_print(g_scr, x, y, g_status, C_ACC, C_BG);
     }
 
-    // Panel mode decides the framing on its own, so the page/width setting it
-    // will go back to is not what the reader is looking at.
     const char *mode = g_view == VIEW_THUMBS ? "thumbs"
                      : g_panel_mode          ? "panels"
                      : g_fit == FIT_WIDTH    ? "width" : "page";
@@ -772,8 +670,6 @@ static void draw_help(void) {
     }
 }
 
-/* -------------------------------------------------------------- render -- */
-
 static void evict_thumbs(void) {
     if (!g_thumbs_ready) return;
     for (int guard = 0; guard < 16; guard++) {
@@ -803,12 +699,6 @@ static void render(void) {
     term_flush();
 }
 
-/* ---------------------------------------------------------------- keys -- */
-
-
-// Scroll the width-fitted page by `cells` screen rows. Returns false when it
-// was already against that end of the page, which is the caller's cue to turn
-// the page rather than leave the key doing nothing.
 static bool scroll_by(int cells) {
     if (g_fit != FIT_WIDTH || g_panel_mode) return false;
     int pw = 0, ph = 0;
@@ -820,9 +710,8 @@ static bool scroll_by(int cells) {
     int box_px_h = (g_scr->height - 1) * g_cell_h;
     if (box_px_w < 1 || box_px_h < 1) return false;
 
-    // What the window shows of the page, and so how far there is to scroll.
     int shown = (int)((int64_t)pw * box_px_h / box_px_w);
-    if (shown >= ph) return false;                  // the whole page is up
+    if (shown >= ph) return false;
     int max_scroll = ph - shown;
 
     int per_cell = (int)((int64_t)pw * g_cell_h / box_px_w);
@@ -843,7 +732,7 @@ static void switch_book(int delta) {
 }
 
 static void handle_key(const InputEvent *ev, bool *quit, bool *dirty) {
-    // Any key dismisses the help panel; only the quit keys and '?' also act.
+
     if (g_show_help) {
         g_show_help = false;
         *dirty = true;
@@ -924,7 +813,7 @@ static void handle_key(const InputEvent *ev, bool *quit, bool *dirty) {
         case KEY_CHAR:
             switch (ev->ch) {
                 case 'q':
-                case KEY_INTR:   // ISIG is off in raw mode, so this arrives as a byte
+                case KEY_INTR:
                     *quit = true;
                     break;
                 case 'l': step_forward(); *dirty = true; break;
@@ -945,10 +834,7 @@ static void handle_key(const InputEvent *ev, bool *quit, bool *dirty) {
                 case 'g': goto_page(0, false); *dirty = true; break;
                 case 'G': goto_page(npages() - 1, false); *dirty = true; break;
                 case 'f':
-                    // The panel is left where it was, so looking at the whole
-                    // page and coming back returns to the panel being read.
-                    // Turning a page in page view resets it, so arriving on a
-                    // new page still starts at its first panel.
+
                     g_panel_mode = !g_panel_mode;
                     g_view = VIEW_PAGE;
                     if (g_panel_mode) {
@@ -976,9 +862,8 @@ static void handle_key(const InputEvent *ev, bool *quit, bool *dirty) {
                     if (g_thumb_size > 4) { g_thumb_size--; *dirty = true; }
                     break;
                 case '?': g_show_help = !g_show_help; *dirty = true; break;
-                case 0x0c:   // ctrl-l
-                    // Cell diffing never resends what it believes the terminal
-                    // already has, so anything dropped in transit stays dropped.
+                case 0x0c:
+
                     drop_terminal_images();
                     invalidate_main();
                     if (g_thumbs_ready)
@@ -993,14 +878,8 @@ static void handle_key(const InputEvent *ev, bool *quit, bool *dirty) {
     }
 }
 
-
-/* ---------------------------------------------------------------- read -- */
-
 bool comic_is_file(const char *path) { return book_is_comic(path); }
 
-// Walking the caches means stat-ing every file in them, so it happens on a
-// thread of its own and nothing waits on the result. Started after the current
-// book is open so the prune sees it as the most recently used one.
 static void *prune_thread(void *keep) {
     dc_prune(THUMB_CACHE_BUDGET);
     book_cache_prune(BOOK_CACHE_BUDGET, (const char *)keep);
@@ -1029,8 +908,6 @@ int comic_read(char **paths, int npaths, const ComicOpts *o, Term *tm, Screen *s
     snprintf(thumbdir, sizeof thumbdir, "%s/thumbs", book_cache_root());
     dc_init(thumbdir);
 
-    // Page decoding is compute-bound and only ever a few pages deep, so two
-    // workers keep the read-ahead filled without starving the draw loop.
     if (!pages_init(&g_pages, BG_RGB, PAGE_SLOTS, 2, PAGE_MAX_DIM)) {
         fprintf(stderr, "ep: cannot start decoder threads\n");
         return 1;
@@ -1067,7 +944,7 @@ int comic_read(char **paths, int npaths, const ComicOpts *o, Term *tm, Screen *s
         if (g_page != prev_page) {
             prev_page = g_page;
             pages_set_focus(&g_pages, g_page);
-            g_status[0] = '\0';        // whatever it said was about the old page
+            g_status[0] = '\0';
             dirty = true;
         }
 

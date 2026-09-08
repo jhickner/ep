@@ -1,21 +1,3 @@
-/**
- * page.h - background page decoder with a small resident window
- *
- * In exactly ONE .c file:
- *
- *     #define PAGE_IMPLEMENTATION
- *     #include "page.h"
- *
- * Depends on image.h and panel.h. Unlike a thumbnail cache, a slot here keeps
- * its decoded pixels: the same buffer is scaled to the window for page view and
- * cropped for panel view, so moving between the two costs nothing and neither
- * one re-reads the file. Panels are found on the worker thread as part of the
- * decode, for the same reason.
- *
- * Only a handful of pages are held at once - one is some tens of megabytes - so
- * `pages_want` is also the eviction point: ask for the pages that matter, in
- * the order they matter, and the rest are dropped.
- */
 
 #ifndef PAGE_H
 #define PAGE_H
@@ -41,12 +23,12 @@ typedef enum {
 } PageState;
 
 typedef struct {
-    int       idx;            // page held, -1 when free
+    int       idx;
     int       state;
     int       gen;
-    uint8_t  *rgb;            // decoded page, w*h*3
-    int       w, h;           // decoded size (<= max_dim on the long edge)
-    int       src_w, src_h;   // size on disk
+    uint8_t  *rgb;
+    int       w, h;
+    int       src_w, src_h;
     Panel     panels[PAGE_MAX_PANELS];
     int       npanels;
     int       pins;
@@ -57,7 +39,7 @@ typedef struct {
 typedef struct {
     PageSlot       *slots;
     int             nslots;
-    char          **paths;    // borrowed
+    char          **paths;
     int             npaths;
     pthread_mutex_t mu;
     pthread_cond_t  cv;
@@ -66,40 +48,29 @@ typedef struct {
     bool            stop;
     int             completions;
     int             focus;
-    int             max_dim;  // long edge a page is decoded to, 0 for native
+    int             max_dim;
     uint8_t         bg[3];
 } PageStore;
 
 bool pages_init(PageStore *p, const uint8_t bg[3], int nslots, int nthreads, int max_dim);
 void pages_destroy(PageStore *p);
 
-// Point the store at a book's page list. Everything resident is dropped.
 void pages_set_list(PageStore *p, char **paths, int npaths);
 
-// Keep page `idx` resident, decoding it if it is not. Call for the page being
-// shown first and its neighbours after: a page nobody has asked for since the
-// last frame is what gets evicted to make room.
 void pages_want(PageStore *p, int idx);
 
-// The page work should radiate outwards from. Only affects queue order.
 void pages_set_focus(PageStore *p, int idx);
 
-// Jobs finished since the last call. Non-zero means repaint.
 int pages_take_completions(PageStore *p);
 
 int pages_state(PageStore *p, int idx);
 
-// Borrow page `idx`'s pixels, or NULL if it is not decoded. The buffer stays
-// valid until pages_release; `panels` points into the slot and lives as long.
 const uint8_t *pages_borrow(PageStore *p, int idx, int *w, int *h,
                             const Panel **panels, int *npanels);
 void pages_release(PageStore *p, int idx);
 
-#endif // PAGE_H
+#endif
 
-/* ======================================================================== */
-/* Implementation                                                           */
-/* ======================================================================== */
 #ifdef PAGE_IMPLEMENTATION
 
 #include <stdlib.h>
@@ -107,7 +78,6 @@ void pages_release(PageStore *p, int idx);
 
 static uint64_t g_page_clock = 1;
 
-// Caller holds the mutex.
 static PageSlot *page_find(PageStore *p, int idx) {
     for (int i = 0; i < p->nslots; i++)
         if (p->slots[i].idx == idx && p->slots[i].state != PAGE_EMPTY)
@@ -115,7 +85,6 @@ static PageSlot *page_find(PageStore *p, int idx) {
     return NULL;
 }
 
-// The queued page nearest the focus, or -1. Caller holds the mutex.
 static int page_pick(PageStore *p) {
     int best = -1, best_d = 0;
     for (int i = 0; i < p->nslots; i++) {
@@ -149,8 +118,7 @@ static void *page_worker(void *arg) {
         memset(&im, 0, sizeof im);
         bool ok = false;
         if (path) {
-            // Only cap a page that exceeds the cap: passing a box larger than
-            // the file would have image.h scale the page up to meet it.
+
             int box = 0, pw = 0, ph = 0;
             if (max_dim > 0 && image_probe(path, &pw, &ph) &&
                 (pw > max_dim || ph > max_dim))
@@ -165,7 +133,7 @@ static void *page_worker(void *arg) {
         pthread_mutex_lock(&p->mu);
         s->busy = false;
         if (p->stop || s->gen != gen || s->idx != idx) {
-            image_free(&im);          // the slot was reassigned under us
+            image_free(&im);
         } else if (ok) {
             free(s->rgb);
             s->rgb = im.rgb;
@@ -223,7 +191,7 @@ void pages_set_list(PageStore *p, char **paths, int npaths) {
     p->npaths = npaths;
     for (int i = 0; i < p->nslots; i++) {
         PageSlot *s = &p->slots[i];
-        s->gen++;                     // orphan anything in flight
+        s->gen++;
         if (!s->busy) { free(s->rgb); s->rgb = NULL; }
         s->idx = -1;
         s->state = PAGE_EMPTY;
@@ -249,7 +217,6 @@ void pages_want(PageStore *p, int idx) {
     PageSlot *s = page_find(p, idx);
     if (s) { s->lru = ++g_page_clock; pthread_mutex_unlock(&p->mu); return; }
 
-    // Free slot, else the stalest one nobody is drawing from or working on.
     PageSlot *victim = NULL;
     for (int i = 0; i < p->nslots; i++) {
         PageSlot *c = &p->slots[i];
@@ -314,4 +281,4 @@ void pages_release(PageStore *p, int idx) {
     pthread_mutex_unlock(&p->mu);
 }
 
-#endif // PAGE_IMPLEMENTATION
+#endif

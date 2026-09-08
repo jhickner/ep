@@ -4,16 +4,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Just enough XML to walk an OPF/NCX/XHTML file: find tags by local name,
-   pull attributes off them, and decode entities. No tree, no validation. */
-
 const char *xml_find(const char *p, const char *local);
 bool        xml_attr(const char *tag, const char *attr, char *out, size_t n);
 bool        xml_text(const char *tag, char *out, size_t n);
 size_t      xml_decode(const char *src, size_t len, char *out, size_t n);
 void        url_decode(char *s);
 
-#endif /* XML_H */
+#endif
 
 #ifdef XML_IMPLEMENTATION
 
@@ -22,7 +19,6 @@ void        url_decode(char *s);
 #include <stdlib.h>
 #include <string.h>
 
-/* Namespace prefixes are ignored: <opf:item> matches "item". */
 static const char *xml_local(const char *name, int *len) {
     const char *e = name;
     while (*e && !isspace((unsigned char)*e) && *e != '>' && *e != '/') e++;
@@ -48,7 +44,7 @@ bool xml_attr(const char *tag, const char *attr, char *out, size_t n) {
     size_t alen = strlen(attr);
     const char *p = tag + 1;
     while (*p && *p != '>') {
-        if (*p == '"' || *p == '\'') {          // skip a value
+        if (*p == '"' || *p == '\'') {
             char q = *p++;
             while (*p && *p != q) p++;
             if (*p) p++;
@@ -81,7 +77,6 @@ bool xml_attr(const char *tag, const char *attr, char *out, size_t n) {
     return false;
 }
 
-/* Text content of a tag, up to its closing tag; nested markup is stripped. */
 bool xml_text(const char *tag, char *out, size_t n) {
     const char *p = strchr(tag, '>');
     if (!p) return false;
@@ -165,4 +160,4 @@ void url_decode(char *s) {
     *w = 0;
 }
 
-#endif /* XML_IMPLEMENTATION */
+#endif

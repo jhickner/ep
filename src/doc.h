@@ -4,23 +4,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* An XHTML chapter reduced to a list of blocks: a paragraph of styled text,
-   an image, or a rule. Blocks are width-independent; layout.h wraps them. */
-
 enum { BLK_TEXT, BLK_IMG, BLK_RULE };
 
 enum { DS_BOLD = 1, DS_ITALIC = 2, DS_DIM = 4 };
 
 typedef struct {
     int            type;
-    char          *text;      /* whitespace-collapsed UTF-8 */
-    unsigned char *style;     /* one DS_* byte per byte of text */
+    char          *text;
+    unsigned char *style;
     int            len;
     int            indent;
     bool           center;
     bool           heading;
-    int            before;    /* blank lines before the block */
-    char          *src;       /* BLK_IMG: zip path of the image */
+    int            before;
+    char          *src;
 } Block;
 
 typedef struct { char *id; int block; } Anchor;
@@ -34,7 +31,7 @@ Doc  doc_parse(const char *xhtml, const char *base_dir);
 void doc_free(Doc *d);
 int  doc_anchor_block(const Doc *d, const char *id);
 
-#endif /* DOC_H */
+#endif
 
 #ifdef DOC_IMPLEMENTATION
 
@@ -94,7 +91,6 @@ static Block *block_new(Parser *p, int type) {
     return b;
 }
 
-/* Close the paragraph under construction, dropping it if it is blank. */
 static void flush(Parser *p) {
     while (p->len > 0 && p->buf[p->len - 1] == ' ') p->len--;
     p->pending_space = false;
@@ -119,7 +115,7 @@ static void anchor_add(Parser *p, const char *id) {
                               (size_t)(p->doc->nanchors + 1) * sizeof(Anchor));
     Anchor *a = &p->doc->anchors[p->doc->nanchors++];
     a->id    = strdup(id);
-    a->block = p->doc->nblocks;   /* the next block to be produced */
+    a->block = p->doc->nblocks;
 }
 
 static bool tag_is(const char *lt, const char *name) {
@@ -165,7 +161,7 @@ static void text_run(Parser *p, const char *s, int n) {
     char decoded[4096];
     while (n > 0) {
         int chunk = n > 2000 ? 2000 : n;
-        /* Do not split an entity across chunks. */
+
         if (chunk < n) {
             int back = 0;
             while (back < 12 && chunk - back > 0 && s[chunk - back - 1] != '&') back++;
@@ -204,7 +200,7 @@ Doc doc_parse(const char *xhtml, const char *base_dir) {
         if (!lt) { text_run(&p, cur, (int)strlen(cur)); break; }
         if (lt > cur) text_run(&p, cur, (int)(lt - cur));
 
-        if (lt[1] == '!' || lt[1] == '?') {          /* comment / doctype / CDATA */
+        if (lt[1] == '!' || lt[1] == '?') {
             const char *gt = strncmp(lt, "<!--", 4) == 0 ? strstr(lt, "-->") : strchr(lt, '>');
             cur = gt ? gt + (strncmp(lt, "<!--", 4) == 0 ? 3 : 1) : lt + 1;
             continue;
@@ -226,7 +222,7 @@ Doc doc_parse(const char *xhtml, const char *base_dir) {
 
         if (lt[1] != '/') {
             char id[128] = "";
-            /* An id on inline markup still anchors to its paragraph. */
+
             if (xml_attr(lt, "id", id, sizeof id) && *id) anchor_add(&p, id);
         }
 
@@ -377,4 +373,4 @@ void doc_free(Doc *d) {
     memset(d, 0, sizeof *d);
 }
 
-#endif /* DOC_IMPLEMENTATION */
+#endif

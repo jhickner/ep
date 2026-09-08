@@ -1,26 +1,3 @@
-/**
- * cache.h - threaded thumbnail cache (single-header)
- *
- * In exactly ONE .c file:
- *
- *     #define CACHE_IMPLEMENTATION
- *     #include "cache.h"
- *
- * Depends on image.h and diskcache.h. Worker threads decode and resample in the
- * background; the main thread only ever requests, polls, and draws. Requesting a
- * slot at a different box size supersedes any in-flight work for it.
- *
- * Work is served nearest-the-focus first rather than in arrival order. A
- * viewport scrolled several screens in a second would otherwise leave workers
- * grinding through rows nobody is looking at any more, because every visible
- * cell re-requests itself each frame.
- *
- * Results arrive in two passes. The first may be a JPEG's embedded thumbnail,
- * which costs almost nothing and fills the grid immediately; because such a
- * thumbnail can be stale, the slot is then re-queued behind all visible work
- * for a real decode that replaces it. Only that second result is written to the
- * disk store, so a directory is instant and correct on every later visit.
- */
 
 #ifndef CACHE_H
 #define CACHE_H
@@ -45,16 +22,16 @@ typedef enum {
 
 typedef struct {
     int state;
-    int gen;              // bumped on every request; stale results are dropped
-    const char *path;     // borrowed from the caller's file list
-    int box_w, box_h;     // box currently requested
-    uint8_t *rgb;         // scaled pixels, freed once handed to the terminal
-    int w, h;             // scaled size
-    int src_w, src_h;     // size on disk
-    bool sent;            // pixel data currently resident in the terminal
-    bool busy;            // a worker holds this slot
-    bool provisional;     // showing an embedded thumbnail, pending a real decode
-    int pass;             // 0 = nothing yet, 1 = provisional shown, 2 = final
+    int gen;
+    const char *path;
+    int box_w, box_h;
+    uint8_t *rgb;
+    int w, h;
+    int src_w, src_h;
+    bool sent;
+    bool busy;
+    bool provisional;
+    int pass;
     uint64_t lru;
 } Slot;
 
@@ -63,63 +40,38 @@ typedef struct {
     int n;
     pthread_mutex_t mu;
     pthread_cond_t cv;
-    int focus;            // index the viewport is centred on
-    int win_lo, win_hi;   // inclusive range still worth working on
+    int focus;
+    int win_lo, win_hi;
     pthread_t *threads;
     int nthreads;
     bool stop;
-    int completions;      // consumed by cache_take_completions()
-    bool use_disk;        // consult diskcache.h for results this size
+    int completions;
+    bool use_disk;
     uint8_t bg[3];
 } Cache;
 
 bool cache_init(Cache *c, int n, int nthreads, const uint8_t bg[3], bool use_disk);
 void cache_destroy(Cache *c);
 
-// Set the index work should radiate outwards from - normally the selection.
-// Only affects the order pending jobs are picked up in.
 void cache_set_focus(Cache *c, int i);
 
-// Confine work to [lo, hi]: queued jobs outside it are cancelled, in-flight
-// ones are abandoned at the next checkpoint, and decoded pixels nobody
-// collected are released. Call once per frame with the visible range plus
-// whatever margin should stay warm.
-//
-// This is what keeps a fast scroll from committing the decoder to every image
-// it flew past. Nothing is lost that costs much to recover: a cancelled slot
-// re-requests itself the moment it is on screen again, and by then its pixels
-// are usually in the disk store.
 void cache_set_window(Cache *c, int lo, int hi);
 
-// Ask for slot `i` scaled to fit box_w x box_h pixels. Cheap and idempotent:
-// a repeat request for a size already ready or in flight does nothing.
 void cache_request(Cache *c, int i, const char *path, int box_w, int box_h);
 
-// Number of jobs that finished since the last call. Non-zero means repaint.
 int cache_take_completions(Cache *c);
 
-// Snapshot slot `i` for drawing. `out->rgb` is always NULL - pixels can only
-// be obtained through cache_take_pixels, which is race-free.
 void cache_peek(Cache *c, int i, Slot *out);
 
-// Detach slot `i`'s pixels for transmission and mark it resident in the
-// terminal. Returns NULL if there are none pending; otherwise the caller owns
-// the buffer and must free it.
 uint8_t *cache_take_pixels(Cache *c, int i, int *w, int *h);
 
-// Forget that slot `i` is resident in the terminal (after a kitty delete).
 void cache_mark_evicted(Cache *c, int i);
 
-// Touch slot `i`'s recency and return the least-recently-used resident slot
-// other than the ones in `keep`, or -1 when fewer than `limit` are resident.
 void cache_touch(Cache *c, int i);
 int cache_lru_victim(Cache *c, int limit);
 
-#endif // CACHE_H
+#endif
 
-/* ======================================================================== */
-/* Implementation                                                           */
-/* ======================================================================== */
 #ifdef CACHE_IMPLEMENTATION
 
 #include <stdlib.h>
@@ -129,19 +81,8 @@ int cache_lru_victim(Cache *c, int limit);
 
 static uint64_t g_cache_clock = 1;
 
-// Added to a slot's priority once it holds a provisional result, which parks
-// every refinement behind every slot still waiting for its first pixels.
 #define CACHE_REFINE_PENALTY (1 << 20)
 
-// The most urgent unclaimed job in the window, or -1. Caller holds the mutex.
-//
-// Priority is computed here against the focus as it stands now, never stored on
-// the slot. A stored priority goes stale the instant the viewport moves: a slot
-// queued while it was under the cursor would keep its head-of-queue standing
-// long after scrolling left it far behind, and hundreds of those will bury the
-// handful of images actually on screen.
-//
-// Scanning only the window also keeps this off the directory size.
 static int cache_pick(Cache *c) {
     int best = -1, best_prio = INT_MAX;
     int lo = c->win_lo < 0 ? 0 : c->win_lo;
@@ -150,8 +91,7 @@ static int cache_pick(Cache *c) {
     for (int i = lo; i <= hi; i++) {
         const Slot *s = &c->slots[i];
         if (s->busy) continue;
-        // pass 1 means the slot is displayable but still owes a real decode; it
-        // stays eligible without ever leaving SLOT_READY.
+
         bool owed = (s->state == SLOT_QUEUED) ||
                     (s->state == SLOT_READY && s->pass == 1);
         if (!owed) continue;
@@ -164,9 +104,6 @@ static int cache_pick(Cache *c) {
     return best;
 }
 
-// What a worker consults mid-decode to decide whether the result is still
-// wanted. The generation catches a re-request or a resize; the window catches
-// the row having scrolled away.
 typedef struct {
     Cache *c;
     int idx, gen;
@@ -206,9 +143,6 @@ static void *cache_worker(void *arg) {
         int dw = 0, dh = 0, sw = 0, sh = 0;
         bool provisional = false;
 
-        // The disk store is keyed on the file's identity, so one stat decides
-        // both whether to look and what to look for. Only final results are
-        // ever stored, so a hit needs no refining.
         struct stat st;
         bool have_st = use_disk && stat(path, &st) == 0;
         if (pass == 0 && have_st)
@@ -217,8 +151,7 @@ static void *cache_worker(void *arg) {
 
         CacheAbort ab = { c, i, gen };
         if (!scaled) {
-            // The refining pass is the one that must be right, so it is the one
-            // that refuses the embedded thumbnail.
+
             Image im;
             int flags = (pass == 0) ? 0 : IMAGE_NO_EXIF_THUMB;
             if (image_load_fit_cancel(path, bg, bw, bh, flags,
@@ -233,16 +166,11 @@ static void *cache_worker(void *arg) {
             }
         }
 
-        // Distinguish work we gave up on from work that genuinely failed: an
-        // abandoned slot has to look untouched, or it would show an error mark
-        // and never be retried when it scrolls back on screen.
         bool abandoned = !scaled && cache_abort(&ab);
 
         pthread_mutex_lock(&c->mu);
         s->busy = false;
-        // A resize or a re-request while we were decoding invalidates this
-        // result. The slot is still SLOT_QUEUED in that case, so waking a
-        // worker hands it straight back out with the new box.
+
         if (s->gen != gen) {
             free(scaled);
             pthread_cond_signal(&c->cv);
@@ -253,9 +181,7 @@ static void *cache_worker(void *arg) {
             s->provisional = false;
             s->box_w = s->box_h = 0;
         } else if (pass == 1 && !scaled) {
-            // The refinement failed on a file whose thumbnail decoded fine.
-            // Keep what is on screen rather than replacing a usable image with
-            // an error mark; it is the best we are going to get.
+
             s->pass = 2;
             s->provisional = false;
         } else {
@@ -268,9 +194,7 @@ static void *cache_worker(void *arg) {
             s->provisional = provisional;
             s->pass = provisional ? 1 : 2;
             c->completions++;
-            // pass 1 leaves the slot eligible for a second look, but behind
-            // every slot still waiting for its first pixels. The state stays
-            // SLOT_READY throughout, so what is on screen is never taken away.
+
             if (provisional) pthread_cond_signal(&c->cv);
         }
         pthread_mutex_unlock(&c->mu);
@@ -332,15 +256,13 @@ void cache_set_window(Cache *c, int lo, int hi) {
     for (int i = 0; i < c->n; i++) {
         if (i >= lo && i <= hi) continue;
         Slot *s = &c->slots[i];
-        if (s->busy) continue;   // a worker owns it and checks the window itself
+        if (s->busy) continue;
 
         if (s->state == SLOT_QUEUED) {
-            s->state = SLOT_EMPTY;   // never started; simply forget it
+            s->state = SLOT_EMPTY;
             s->gen++;
         } else if (s->rgb && !s->sent) {
-            // Decoded, but scrolled past before anything collected it. The disk
-            // store makes this cheap to produce again, so the memory is better
-            // spent on what is actually on screen.
+
             free(s->rgb);
             s->rgb = NULL;
             s->state = SLOT_EMPTY;
@@ -410,12 +332,11 @@ void cache_mark_evicted(Cache *c, int i) {
     pthread_mutex_lock(&c->mu);
     Slot *s = &c->slots[i];
     s->sent = false;
-    s->state = SLOT_EMPTY;   // pixels are gone from both sides; decode again on demand
+    s->state = SLOT_EMPTY;
     s->box_w = s->box_h = 0;
     s->pass = 0;
     s->provisional = false;
-    // Bump the generation so a job still decoding the old path (the file list
-    // may have just been re-sorted under it) can't publish into this slot.
+
     s->gen++;
     free(s->rgb);
     s->rgb = NULL;
@@ -442,4 +363,4 @@ int cache_lru_victim(Cache *c, int limit) {
     return resident > limit ? victim : -1;
 }
 
-#endif // CACHE_IMPLEMENTATION
+#endif

@@ -934,8 +934,6 @@ static bool term_colorfgbg(bool background, uint8_t *r, uint8_t *g, uint8_t *b) 
     return true;
 }
 
-/* One question and its answer. The caller supplies the escape because the
-   same question has to be asked two ways under tmux. */
 static bool term_osc_exchange(const char *query, int qlen, uint8_t *r,
                               uint8_t *g, uint8_t *b, int timeout_ms) {
     struct termios orig;
@@ -976,7 +974,6 @@ static bool term_osc_exchange(const char *query, int qlen, uint8_t *r,
             len += (size_t)n;
             buf[len] = '\0';
 
-            /* Most terminals answer rgb:RRRR/GGGG/BBBB; a few use #RRGGBB. */
             const char *rgb = strstr(buf, "rgb:");
             const char *hash = strchr(buf, '#');
             bool done = memchr(buf, '\a', len) != NULL || strstr(buf, "\x1b\\");
@@ -1003,12 +1000,6 @@ static bool term_osc_exchange(const char *query, int qlen, uint8_t *r,
     return ok;
 }
 
-/* OSC 10 is the foreground, OSC 11 the background; the exchange is the same.
- *
- * Under tmux the question gets asked twice. tmux answers it itself when it
- * can, which is the quick way; when it cannot, the query has to travel to the
- * terminal outside as a passthrough with its ESCs doubled - the treatment
- * kitty.h gives its graphics escapes, and it needs allow-passthrough set. */
 static bool term_query_osc_color(int osc, uint8_t *r, uint8_t *g, uint8_t *b,
                                  int timeout_ms) {
     bool background = osc == 11;

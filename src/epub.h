@@ -14,20 +14,20 @@ typedef struct {
 
 typedef struct {
     char *title;
-    char *href;      /* zip path of the target document */
-    char *anchor;    /* fragment id, or NULL */
-    int   spine;     /* spine index, or -1 */
+    char *href;
+    char *anchor;
+    int   spine;
     int   depth;
 } EpubTocEntry;
 
 typedef struct {
     Zip   zip;
-    char  root[512];              /* directory of the OPF, "" or "dir/" */
+    char  root[512];
     char  title[256], author[256];
-    char *cover;                  /* zip path of the cover image, or NULL */
+    char *cover;
 
     EpubItem *items;   int nitems;
-    char    **spine;   int nspine;   /* zip paths, spine order */
+    char    **spine;   int nspine;
 
     EpubTocEntry *toc; int ntoc;
 } Epub;
@@ -37,7 +37,7 @@ void  epub_close(Epub *e);
 void *epub_read(Epub *e, const char *zip_path, size_t *len);
 void  epub_resolve(const char *base_dir, const char *href, char *out, size_t n);
 
-#endif /* EPUB_H */
+#endif
 
 #ifdef EPUB_IMPLEMENTATION
 
@@ -54,7 +54,6 @@ void *epub_read(Epub *e, const char *zip_path, size_t *len) {
     return zip_read(&e->zip, zip_path, len);
 }
 
-/* Resolve a possibly-relative href against a directory, collapsing "..". */
 void epub_resolve(const char *base_dir, const char *href, char *out, size_t n) {
     char tmp[1024];
     if (href[0] == '/') snprintf(tmp, sizeof tmp, "%s", href + 1);
@@ -106,7 +105,6 @@ static void toc_push(Epub *e, const char *title, const char *href, int depth) {
     t->spine  = spine_index(e, full);
 }
 
-/* NCX (epub2): nested <navPoint><navLabel><text>..</text></navLabel><content src=..> */
 static void parse_ncx(Epub *e, const char *xml) {
     int depth = 0;
     const char *p = xml;
@@ -130,7 +128,6 @@ static void parse_ncx(Epub *e, const char *xml) {
     }
 }
 
-/* Nav document (epub3): <nav epub:type="toc"> with nested <ol><li><a href>. */
 static void parse_nav(Epub *e, const char *xml) {
     const char *nav = xml;
     for (;;) {
@@ -152,7 +149,7 @@ static void parse_nav(Epub *e, const char *xml) {
         if (strncasecmp(lt, "<a", 2) == 0 && (lt[2] == ' ' || lt[2] == '>')) {
             char href[512] = "", title[256] = "";
             xml_attr(lt, "href", href, sizeof href);
-            /* The label may wrap inline markup; take text up to </a>. */
+
             const char *gt = strchr(lt, '>');
             const char *end = gt ? strcasestr(gt, "</a") : NULL;
             if (gt && end) {
@@ -242,7 +239,6 @@ static void parse_opf(Epub *e, const char *opf_path, char *xml) {
         }
     }
 
-    /* Table of contents: epub3 nav document first, then the epub2 NCX. */
     char *doc = NULL;
     for (int i = 0; i < e->nitems && !e->ntoc; i++) {
         if (!e->items[i].props || !strstr(e->items[i].props, "nav")) continue;
@@ -277,7 +273,7 @@ bool epub_open(Epub *e, const char *path) {
         if (rf) xml_attr(rf, "full-path", opf_path, sizeof opf_path);
         free(container);
     }
-    if (!*opf_path) {           /* fall back to any .opf in the archive */
+    if (!*opf_path) {
         for (int i = 0; i < e->zip.count; i++) {
             const char *n = e->zip.entries[i].name;
             size_t l = strlen(n);
@@ -314,4 +310,4 @@ void epub_close(Epub *e) {
     memset(e, 0, sizeof *e);
 }
 
-#endif /* EPUB_IMPLEMENTATION */
+#endif

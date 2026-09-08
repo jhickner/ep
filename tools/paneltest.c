@@ -1,12 +1,3 @@
-/**
- * paneltest - draw a page's detected panels over the page, as a PPM
- *
- *     paneltest <image> [out.ppm]
- *
- * Each panel is outlined and tagged with that many ticks along its top edge, so
- * both the boxes and the reading order can be checked at a glance. The panel
- * rectangles are also printed to stdout.
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,9 +37,6 @@ int main(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: paneltest <image> [out.ppm]\n"); return 2; }
     const uint8_t bg[3] = { 0x11, 0x12, 0x16 };
 
-    // Decode the way the reader does, or the panels measured here are not the
-    // panels it will find: page.h caps a page at PAGE_MAX_DIM and otherwise
-    // leaves it at native size.
     int cap = 0, pw = 0, ph = 0;
     if (image_probe(argv[1], &pw, &ph) && (pw > 3000 || ph > 3000)) cap = 3000;
 
@@ -74,8 +62,6 @@ int main(int argc, char **argv) {
         printf("  %2d  x=%-5d y=%-5d w=%-5d h=%-5d\n",
                i + 1, panels[i].x, panels[i].y, panels[i].w, panels[i].h);
 
-        // Cycle through a few saturated colours so adjacent panels never share
-        // one, and mark the ordinal with ticks inside the top edge.
         static const uint8_t pal[6][3] = {
             {0xff,0x30,0x30}, {0x30,0xd0,0xff}, {0x40,0xff,0x60},
             {0xff,0xd0,0x20}, {0xff,0x40,0xff}, {0xff,0xff,0xff},

@@ -1,20 +1,6 @@
 #ifndef PICK_H
 #define PICK_H
 
-/**
- * pick.h - line-mode menus that run on the terminal as it is.
- *
- * They draw in the normal flow and wipe themselves afterwards, so cancelling
- * one leaves the shell exactly as it was. The primitives build any such menu;
- * pick_dir() is the directory lister: folder navigation, / fuzzy search, and
- * an accept callback so each app lists only what it can open.
- *
- * In exactly one .c file:
- *
- *     #define PICK_IMPLEMENTATION
- *     #include "pick.h"
- */
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <termios.h>
@@ -33,7 +19,7 @@
 typedef struct {
     struct termios saved;
     bool restore;
-    int  lines;          /* header plus rows, so the wipe knows its extent */
+    int  lines;
 } Pick;
 
 void     pick_begin(Pick *p, int lines);
@@ -48,25 +34,20 @@ bool     pick_fuzzy(const char *hay, const char *needle, int *score);
 void     pick_fit(char *out, size_t cap, const char *s, int max);
 int      pick_natcmp(const char *a, const char *b);
 
-/* True to list this entry. Directories are offered unless this returns false.
-   NULL lists every non-hidden name. */
 typedef bool (*PickAcceptFn)(const char *path, const char *name, bool is_dir, void *ctx);
 
-/* True if selecting this directory should return it rather than enter it.
-   NULL always descends. Files are always returned. */
 typedef bool (*PickLeafFn)(const char *path, void *ctx);
 
 typedef struct {
-    const char  *title;     /* header label; NULL → "Open" */
+    const char  *title;
     PickAcceptFn accept;
     PickLeafFn   leaf;
     void        *ctx;
 } PickDir;
 
-/* Writes the chosen path to `out`. Returns 0 on a pick, 1 if cancelled. */
 int pick_dir(const char *start, char *out, size_t cap, const PickDir *opts);
 
-#endif /* PICK_H */
+#endif
 
 #ifdef PICK_IMPLEMENTATION
 
@@ -86,17 +67,12 @@ int pick_dir(const char *start, char *out, size_t cap, const PickDir *opts);
 #define PATH_MAX 4096
 #endif
 
-/* Display columns, not bytes: the arrows and separators in the hints are two
-   and three bytes each, and measuring them as bytes is what makes a header
-   three times wider than it looks. */
 int pick_cols(const char *s) {
     int n = 0;
     for (const char *p = s; *p; p++) if (((unsigned char)*p & 0xC0) != 0x80) n++;
     return n;
 }
 
-/* Copies `s` into `out`, cut to `max` columns with a trailing ellipsis. The cut
-   falls on a character boundary, so a multi-byte name is never split. */
 void pick_fit(char *out, size_t cap, const char *s, int max) {
     if (!cap) return;
     if (max < 1) { out[0] = '\0'; return; }
@@ -110,10 +86,6 @@ void pick_fit(char *out, size_t cap, const char *s, int max) {
     snprintf(out, cap, "%.*s\xe2\x80\xa6", (int)i, s);
 }
 
-/* Case-insensitive subsequence match, the way a fuzzy finder means it: every
-   character of `needle` appears in `hay`, in order, not necessarily adjacent.
-   The score favours runs of adjacent matches and matches that start a word, so
-   "bld" ranks "Bloodstone" above "Bumbling Idlers". */
 bool pick_fuzzy(const char *hay, const char *needle, int *score) {
     if (!*needle) { if (score) *score = 0; return true; }
 
@@ -139,7 +111,7 @@ bool pick_fuzzy(const char *hay, const char *needle, int *score) {
         }
         run = adjacent ? run + 1 : 0;
         total += 1 + run * 8 + (word_start ? 6 : 0);
-        total -= (int)(found - h) / 4;          /* the further the reach, the weaker */
+        total -= (int)(found - h) / 4;
         h = found + 1;
     }
     if (score) *score = total;
@@ -172,8 +144,7 @@ void pick_begin(Pick *p, int lines) {
     p->restore = tcgetattr(STDIN_FILENO, &p->saved) == 0;
     if (p->restore) {
         struct termios raw = p->saved;
-        /* ISIG off too, so ctrl-c arrives as a byte to cancel on rather than
-           killing us with the cursor hidden and echo off. */
+
         raw.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG);
         raw.c_cc[VMIN] = 1;
         raw.c_cc[VTIME] = 0;
@@ -182,7 +153,6 @@ void pick_begin(Pick *p, int lines) {
     fputs("\x1b[?25l", stdout);
 }
 
-/* Back to the top of the menu, to draw the next frame over the last one. */
 void pick_home(const Pick *p) {
     if (p->lines > 1) printf("\r\x1b[%dA", p->lines - 1);
 }
@@ -207,8 +177,6 @@ void pick_size(int *cols, int *rows) {
     }
 }
 
-/* `dim` marks a row as spent - a book already read to the end - so the list
-   reads as what is left to do without hiding what is not. */
 void pick_row(int idx, int sel, const char *text, int linew, bool dim) {
     char shown[700];
     pick_fit(shown, sizeof shown, text, linew);
@@ -221,9 +189,6 @@ void pick_row(int idx, int sel, const char *text, int linew, bool dim) {
     else            printf("   %s%*s", shown, pad, "");
 }
 
-/* The header, kept inside the window. A line wider than the terminal wraps, and
-   a wrapped header pushes every row down a line while the redraw goes on
-   addressing the old geometry - which is what tears the menu. */
 void pick_header(const char *title, const char *subject, const char *hint, int cols) {
     int used = pick_cols(title), hintw = pick_cols(hint);
     bool with_hint = subject ? (cols - used - 1 - 2 - hintw >= 8)
@@ -239,7 +204,6 @@ void pick_header(const char *title, const char *subject, const char *hint, int c
     if (with_hint) printf("  \x1b[2m%s\x1b[0m", hint);
 }
 
-/* A key code, a raw byte, or 0 at end of input. */
 unsigned pick_key(void) {
     unsigned char b;
     if (read(STDIN_FILENO, &b, 1) != 1) return 0;
@@ -261,8 +225,6 @@ unsigned pick_key(void) {
         default:  return PICK_ESC;
     }
 }
-
-/* ---------------------------------------------------------------- dir -- */
 
 typedef struct {
     char name[256];
@@ -391,8 +353,6 @@ int pick_dir(const char *start, char *out, size_t cap, const PickDir *opts) {
         unsigned k = pick_key();
         bool refilter = false;
 
-        /* While a filter is being typed the letters belong to it, so only the
-           keys that cannot be part of a query still navigate. */
         if (filtering && k < 0x100 && k >= ' ' && k != 0x7f) {
             if (nq < (int)sizeof query - 1) { query[nq++] = (char)k; query[nq] = 0; }
             refilter = true;
@@ -423,7 +383,7 @@ int pick_dir(const char *start, char *out, size_t cap, const PickDir *opts) {
                 n = pick_dir_load(dir, e, PICK_DIR_MAX, &o);
                 filtering = false; nq = 0; query[0] = 0;
                 pick_dir_reset_view(view, &nview, n);
-                /* Come back out onto the directory just left, not onto the top. */
+
                 sel = 0;
                 for (int i = 0; i < nview; i++)
                     if (!strcmp(e[view[i]].path, was)) { sel = i; break; }
@@ -475,4 +435,4 @@ int pick_dir(const char *start, char *out, size_t cap, const PickDir *opts) {
     return chosen ? 0 : 1;
 }
 
-#endif /* PICK_IMPLEMENTATION */
+#endif

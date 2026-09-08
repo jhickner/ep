@@ -23,7 +23,7 @@ void  zip_close(Zip *z);
 int   zip_find(const Zip *z, const char *name);
 void *zip_read(Zip *z, const char *name, size_t *out_len);
 
-#endif /* ZIP_H */
+#endif
 
 #ifdef ZIP_IMPLEMENTATION
 
@@ -46,7 +46,6 @@ bool zip_open(Zip *z, const char *path) {
     long fsize = ftell(z->f);
     if (fsize < 22) goto fail;
 
-    // The end-of-central-directory record sits within the last 64K + 22 bytes.
     long tail = fsize < 66000 ? fsize : 66000;
     uint8_t *buf = malloc((size_t)tail);
     if (!buf) goto fail;
@@ -112,7 +111,7 @@ void zip_close(Zip *z) {
 int zip_find(const Zip *z, const char *name) {
     for (int i = 0; i < z->count; i++)
         if (strcmp(z->entries[i].name, name) == 0) return i;
-    // Some producers differ only in case, or leave a leading "./".
+
     for (int i = 0; i < z->count; i++)
         if (strcasecmp(z->entries[i].name, name) == 0) return i;
     return -1;
@@ -158,4 +157,4 @@ void *zip_read(Zip *z, const char *name, size_t *out_len) {
     return out;
 }
 
-#endif /* ZIP_IMPLEMENTATION */
+#endif

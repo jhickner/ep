@@ -1,20 +1,6 @@
 #ifndef STATE_H
 #define STATE_H
 
-/**
- * state.h - where each book was left, in ~/.config/ep/state.
- *
- * One line per book, most recently read first:
- *
- *     spine <tab> block <tab> when <tab> page <tab> total <tab> mode <tab>
- *     off <tab> path
- *
- * `spine`/`block`/`off` are the reading position and are exact; `off` is a
- * byte offset into the block, so the place survives a change of column width.
- * `page`/`total` are the printed-page estimate shown in the status line and
- * by --resume. Lines written before `off` existed simply parse without it.
- */
-
 #include <limits.h>
 #include <stdbool.h>
 #include <time.h>
@@ -24,7 +10,7 @@
 typedef struct {
     int         spine, block, off, page, total, mode;
     time_t      when;
-    const char *path;    /* into the line parsed, so it does not outlive it */
+    const char *path;
 } StateLine;
 
 typedef struct {
@@ -40,7 +26,7 @@ void state_forget(const char *path);
 int  state_recent(RecentBook *out, int cap);
 void state_dir(char *out, size_t n);
 
-#endif /* STATE_H */
+#endif
 
 #ifdef STATE_IMPLEMENTATION
 
@@ -49,8 +35,6 @@ void state_dir(char *out, size_t n);
 #include <string.h>
 #include <sys/stat.h>
 
-/* EP_STATE_DIR moves the store somewhere else entirely, so a test run cannot
-   touch the history of the books actually being read. */
 void state_dir(char *out, size_t n) {
     const char *override = getenv("EP_STATE_DIR");
     if (override && *override) { snprintf(out, n, "%s", override); return; }
@@ -64,8 +48,6 @@ static void state_path(char *out, size_t n) {
     snprintf(out, n, "%s/state", dir);
 }
 
-/* Splits a state line in place. Absolute paths never look like a number, so
-   the leading numeric fields are self-delimiting. */
 static bool state_parse(char *line, StateLine *out) {
     char *nl = strchr(line, '\n');
     if (nl) *nl = '\0';
@@ -119,8 +101,6 @@ bool state_lookup(const char *path, StateLine *out) {
     return found;
 }
 
-/* Rewrites the store with `path` at the head, or without it when `spine` is
-   negative. Every other line is carried over as it was. */
 static void state_put(const char *path, int spine, int block, int off, int page, int total, int mode) {
     char sp[PATH_MAX], dir[PATH_MAX];
     state_path(sp, sizeof sp);
@@ -139,7 +119,7 @@ static void state_put(const char *path, int spine, int block, int off, int page,
             snprintf(copy, sizeof copy, "%s", line);
             StateLine sl;
             if (!state_parse(copy, &sl)) continue;
-            if (!strcmp(sl.path, path)) continue;      /* superseded, or dropped */
+            if (!strcmp(sl.path, path)) continue;
             snprintf(keep[nkeep++], sizeof keep[0], "%d\t%d\t%lld\t%d\t%d\t%d\t%d\t%s",
                      sl.spine, sl.block, (long long)sl.when, sl.page, sl.total,
                      sl.mode, sl.off, sl.path);
@@ -147,8 +127,6 @@ static void state_put(const char *path, int spine, int block, int off, int page,
         fclose(f);
     }
 
-    /* Keep the previous generation. The store is small and losing it costs
-       every book's place, so a copy is worth the two syscalls. */
     char bak[PATH_MAX + 8];
     snprintf(bak, sizeof bak, "%s.bak", sp);
     FILE *in = fopen(sp, "r");
@@ -185,7 +163,6 @@ void state_forget(const char *path) {
     state_put(path, -1, 0, 0, 0, 0, 0);
 }
 
-/* Newest first. Books whose file has since gone are left out. */
 int state_recent(RecentBook *out, int cap) {
     char sp[PATH_MAX];
     state_path(sp, sizeof sp);
@@ -220,4 +197,4 @@ int state_recent(RecentBook *out, int cap) {
     return n;
 }
 
-#endif /* STATE_IMPLEMENTATION */
+#endif

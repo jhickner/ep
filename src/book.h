@@ -1,17 +1,3 @@
-/**
- * book.h - open a comic archive as an ordered list of page images
- *
- * In exactly ONE .c file:
- *
- *     #define BOOK_IMPLEMENTATION
- *     #include "book.h"
- *
- * .cbr/.cbz/.cb7/.cbt (and their plain .rar/.zip/.7z/.tar spellings) are
- * unpacked once into ~/.cache/cbr and reused on every later open; a directory
- * is read in place. Unpacking runs through bsdtar, which is libarchive and
- * therefore reads rar as well as zip - no unrar dependency. Pages are the image
- * files found underneath, in natural sort order.
- */
 
 #ifndef BOOK_H
 #define BOOK_H
@@ -19,41 +5,27 @@
 #include <stdbool.h>
 
 typedef struct {
-    char  *path;        // the archive or directory as given
-    char  *title;       // basename, extension stripped
-    char  *dir;         // where the pages live on disk
-    char **pages;       // full paths, natural sort order
+    char  *path;
+    char  *title;
+    char  *dir;
+    char **pages;
     int    npages;
-    bool   extracted;   // dir is ours under the cache, not the user's
+    bool   extracted;
 } Book;
 
-// Unpack if needed and list the pages. Returns false with *b zeroed on failure.
 bool book_open(const char *path, Book *b);
 void book_close(Book *b);
 
-// Where unpacked archives are kept: $XDG_CACHE_HOME/cbr, else ~/.cache/cbr.
 const char *book_cache_root(void);
 
-// Drop unpacked archives, least recently opened first, until the cache is under
-// `budget` bytes, and drop any abandoned part-extraction. Only directories named
-// the way book_open names them are considered, so nothing else under the cache
-// root is ever touched, and `keep` (a Book's dir, or NULL) is never dropped.
-// Walks the whole cache, so call it off the path anything waits on.
 void book_cache_prune(unsigned long long budget, const char *keep);
 
-// True if `path` names something book_open can be expected to handle.
 bool book_is_archive(const char *path);
 
-// Narrower: named as a comic, rather than as an archive that might hold one.
-// What to list when offering a directory's contents, so that a folder of
-// installers and downloads does not read as a shelf of comics.
 bool book_is_comic(const char *path);
 
-#endif // BOOK_H
+#endif
 
-/* ======================================================================== */
-/* Implementation                                                           */
-/* ======================================================================== */
 #ifdef BOOK_IMPLEMENTATION
 
 #include <stdio.h>
@@ -95,15 +67,12 @@ bool book_is_comic(const char *path) {
 static bool book_is_image(const char *name) {
     static const char *exts[] = { "jpg", "jpeg", "png", "gif", "bmp", "webp",
                                   "tif", "tiff", "avif", "heic", NULL };
-    if (name[0] == '.') return false;                  // ._resource forks
+    if (name[0] == '.') return false;
     const char *e = book_ext(name);
     for (int i = 0; exts[i]; i++) if (!strcasecmp(e, exts[i])) return true;
     return false;
 }
 
-/* --------------------------------------------------------------- sort -- */
-
-// Compare with digit runs read as numbers, so page 9 precedes page 10.
 static int book_natcmp(const char *a, const char *b) {
     while (*a && *b) {
         if (*a >= '0' && *a <= '9' && *b >= '0' && *b <= '9') {
@@ -128,8 +97,6 @@ static int book_natcmp(const char *a, const char *b) {
 static int book_cmp(const void *x, const void *y) {
     return book_natcmp(*(char *const *)x, *(char *const *)y);
 }
-
-/* ---------------------------------------------------------------- scan -- */
 
 typedef struct { char **v; int n, cap; } BookVec;
 
@@ -159,8 +126,6 @@ static void book_scan(const char *dir, BookVec *out, int depth) {
     closedir(d);
 }
 
-/* ------------------------------------------------------------- extract -- */
-
 const char *book_cache_root(void) {
     static char root[PATH_MAX];
     if (!root[0]) {
@@ -183,8 +148,6 @@ static void book_mkdirs(const char *path) {
     mkdir(tmp, 0755);
 }
 
-// Identity of the archive's contents: path, size and mtime. Enough that an
-// archive replaced in place unpacks again rather than showing the old pages.
 static unsigned long long book_key(const char *path, const struct stat *st) {
     unsigned long long h = 1469598103934665603ULL;
     for (const char *p = path; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
@@ -207,8 +170,6 @@ static bool book_run(char *const argv[]) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// Unpack into a fresh directory next to the target, then rename it into place,
-// so an interrupted run never leaves a half-archive that looks complete.
 static bool book_extract(const char *archive, const char *dest) {
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof tmp, "%s.part%d", dest, (int)getpid());
@@ -217,14 +178,14 @@ static bool book_extract(const char *archive, const char *dest) {
     char *tar[] = { (char *)"bsdtar", (char *)"-xf", (char *)archive,
                     (char *)"-C", tmp, NULL };
     bool ok = book_run(tar);
-    if (!ok) {   // no bsdtar, or a rar variant libarchive declines
+    if (!ok) {
         char *un[] = { (char *)"unar", (char *)"-q", (char *)"-D",
                        (char *)"-o", tmp, (char *)archive, NULL };
         ok = book_run(un);
     }
     if (!ok) {
         char odir[PATH_MAX];
-        snprintf(odir, sizeof odir, "-o%s", tmp);   // 7z wants it glued on
+        snprintf(odir, sizeof odir, "-o%s", tmp);
         char *sz[] = { (char *)"7z", (char *)"x", (char *)"-y",
                        odir, (char *)archive, NULL };
         ok = book_run(sz);
@@ -234,8 +195,6 @@ static bool book_extract(const char *archive, const char *dest) {
     rename(tmp, dest);
     return true;
 }
-
-/* ---------------------------------------------------------------- open -- */
 
 bool book_open(const char *path, Book *b) {
     memset(b, 0, sizeof *b);
@@ -255,7 +214,7 @@ bool book_open(const char *path, Book *b) {
             book_mkdirs(book_cache_root());
             if (!book_extract(path, dir)) return false;
         } else {
-            utimes(dir, NULL);        // so the prune sees it as recently used
+            utimes(dir, NULL);
         }
         extracted = true;
     }
@@ -279,10 +238,6 @@ bool book_open(const char *path, Book *b) {
     return true;
 }
 
-/* --------------------------------------------------------------- prune -- */
-
-// Named the way book_key names them: exactly sixteen hex digits. A ".part" on
-// the end is what book_extract unpacks into, left behind only by a crash.
 static bool book_is_cache_name(const char *name, bool *part) {
     int n = 0;
     while (isxdigit((unsigned char)name[n])) n++;
@@ -344,8 +299,6 @@ void book_cache_prune(unsigned long long budget, const char *keep) {
         struct stat st;
         if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
 
-        // A part-extraction older than an hour is not one another cbr is still
-        // writing, and it is not a book either, so it goes whatever the budget.
         if (part) {
             if (now - st.st_mtime > BOOK_PART_STALE) {
                 char *rm[] = { (char *)"rm", (char *)"-rf", p, NULL };
@@ -356,7 +309,7 @@ void book_cache_prune(unsigned long long budget, const char *keep) {
 
         snprintf(e[n].path, sizeof e[n].path, "%s", p);
         e[n].size = book_dir_size(p, 0);
-        e[n].used = st.st_mtime;          // book_open touches this on reuse
+        e[n].used = st.st_mtime;
         total += e[n].size;
         n++;
     }
@@ -380,4 +333,4 @@ void book_close(Book *b) {
     memset(b, 0, sizeof *b);
 }
 
-#endif // BOOK_IMPLEMENTATION
+#endif

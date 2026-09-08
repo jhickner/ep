@@ -1,17 +1,6 @@
 #ifndef PDF_H
 #define PDF_H
 
-/**
- * pdf.h - rasterize PDF pages into RGBA windows.
- *
- * On macOS this is CoreGraphics, so there is no subprocess and no temp file.
- * Elsewhere it shells out to poppler's pdftoppm and crops what came back.
- *
- * Rendering is windowed on purpose: the caller asks for the pixels it is about
- * to show, at the scale it will show them, so a page zoomed past the window
- * costs the window rather than the page.
- */
-
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -21,16 +10,12 @@ PdfDoc *pdf_open(const char *path);
 void    pdf_close(PdfDoc *d);
 int     pdf_pages(const PdfDoc *d);
 
-/* Size of a page in points, with its rotation applied. */
 bool pdf_page_size(PdfDoc *d, int page, double *w, double *h);
 
-/* Draw page `page` (0-based) at `scale` pixels per point into an out_w x out_h
-   RGBA buffer, taking the window whose top-left corner is (off_x, off_y) pixels
-   from the page's top-left. Anything outside the page comes back white. */
 bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
                 int out_w, int out_h, uint8_t *rgba);
 
-#endif /* PDF_H */
+#endif
 
 #ifdef PDF_IMPLEMENTATION
 
@@ -76,8 +61,6 @@ void pdf_close(PdfDoc *d) {
 
 int pdf_pages(const PdfDoc *d) { return d ? d->pages : 0; }
 
-/* The crop box is what a viewer shows; the media box usually matches it but
-   includes printer furniture when it does not. */
 static CGPDFPageRef pdf_page(PdfDoc *d, int page) {
     if (!d || page < 0 || page >= d->pages) return NULL;
     return CGPDFDocumentGetPage(d->doc, (size_t)page + 1);
@@ -115,9 +98,6 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
     CGContextSetInterpolationQuality(ctx, kCGInterpolationHigh);
     CGContextSetShouldAntialias(ctx, true);
 
-    /* Walk from the bitmap's bottom-left origin into PDF page space: flip to a
-       top-left origin, slide the window, scale points to pixels, then flip once
-       more because the page itself measures up from its bottom-left. */
     CGContextTranslateCTM(ctx, 0, out_h);
     CGContextScaleCTM(ctx, 1, -1);
     CGContextTranslateCTM(ctx, -off_x, -off_y);
@@ -132,7 +112,7 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
     return true;
 }
 
-#else  /* poppler */
+#else
 
 #include <unistd.h>
 
@@ -174,7 +154,7 @@ PdfDoc *pdf_open(const char *path) {
     if (!pdf_run_int(cmd, "Pages", &n)) { free(d); return NULL; }
     d->pages = (int)n;
     if (pdf_run_int(cmd, "Page size", &w)) d->w = w;
-    /* "Page size: 612 x 792 pts" - the height needs a second look. */
+
     FILE *f = popen(cmd, "r");
     if (f) {
         char line[512];
@@ -234,6 +214,6 @@ bool pdf_render(PdfDoc *d, int page, double scale, int off_x, int off_y,
     return true;
 }
 
-#endif /* __APPLE__ */
+#endif
 
-#endif /* PDF_IMPLEMENTATION */
+#endif

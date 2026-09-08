@@ -1,5 +1,4 @@
-// Renders a page window to a PPM, for checking pdf.h's transforms by eye.
-//   pdfshot file.pdf page scale off_x off_y w h out.ppm
+
 #include <stdio.h>
 #include <stdlib.h>
 #include "../src/pdf.h"
