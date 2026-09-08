@@ -45,6 +45,7 @@
 #include "state.h"
 #define PICK_IMPLEMENTATION
 #include "pick.h"
+#include "comic.h"
 #include "pdf.h"    /* implemented in pdf.c: its CoreGraphics headers and
                        screen.h both want to own the name "Style" */
 #include "type.h"   /* implemented in type.c, for the same reason */
@@ -105,7 +106,9 @@ typedef struct {
 #define EP_SWITCH 3
 
 static bool g_graphics;
-static int  g_cell_w = 10, g_cell_h = 20;
+/* comic.c reads these and calls ui_cell_size(); the readers otherwise share
+   nothing but the terminal. */
+int g_cell_w = 10, g_cell_h = 20;
 
 /* What the terminal said about its own colours, asked for at the same time as
    the graphics probe and for the same reason: both read stdin directly. */
@@ -630,12 +633,18 @@ static bool is_pdf(const char *path) {
 }
 
 static bool is_readable_book(const char *path) {
-    return is_epub(path) || is_pdf(path);
+    return is_epub(path) || is_pdf(path) || comic_is_file(path);
 }
 
 static bool book_accept(const char *path, const char *name, bool is_dir, void *ctx) {
     (void)name; (void)ctx;
     return is_dir || is_readable_book(path);
+}
+
+/* A directory of page images is a comic, and so something to open rather than
+   descend into. Every other directory is a shelf. */
+static bool book_leaf(const char *path, void *ctx) {
+    return comic_leaf(path, ctx);
 }
 
 #define RESUME_MAX 40
@@ -836,21 +845,31 @@ static int dump(Reader *r) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: ep [-w cols] book.epub|book.pdf|dir\n"
+        "usage: ep [options] book.epub|book.pdf|comic.cbz|dir ...\n"
         "       ep --resume\n"
         "\n"
         "  --resume      pick from the books you have been reading\n"
+        "\n"
+        " epubs\n"
         "  --text        wrap the book onto the character grid instead\n"
         "  -w cols       column width for --text (default 76)\n"
         "  --typeset     insist on typeset pages, rather than falling back\n"
         "  --dump        print the book as wrapped text and exit\n"
         "\n"
-        "Books are typeset into pages, which needs macOS and a terminal that\n"
-        "speaks kitty graphics (kitty, Ghostty); without both, --text is what\n"
-        "you get anyway.\n"
+        " comics\n"
+        "  -f            start in panel mode\n"
+        "  -w            start fitted to the window width\n"
         "\n"
-        "A directory is browsed; only epubs, PDFs and directories are listed.\n"
-        "PDFs are shown as page images and need a kitty-graphics terminal.\n");
+        "The file decides the reader: epubs are typeset into pages, PDFs and\n"
+        "comics (.cbr/.cbz/.cb7/.cbt, or a directory of page images) are shown\n"
+        "as images. Several comics may be named at once; ] and [ move between\n"
+        "them.\n"
+        "\n"
+        "Typesetting needs macOS and a terminal that speaks kitty graphics\n"
+        "(kitty, Ghostty); without both, --text is what you get anyway. PDFs\n"
+        "and comics need the graphics terminal outright.\n"
+        "\n"
+        "Any other directory is browsed, listing books and directories.\n");
 }
 
 static Term g_tm;
@@ -965,7 +984,7 @@ static void ui_stop(Screen *s) {
     screen_destroy(s);
 }
 
-static void ui_cell_size(void) {
+void ui_cell_size(void) {
     int cw, ch;
     if (getenv("EP_CELL")) return;
     if (g_graphics && term_cell_size(&g_tm, &cw, &ch) && cw > 1 && ch > 1) {
@@ -1682,6 +1701,10 @@ static int read_pdf(const char *path) {
     int npages = pdf_pages(doc);
 
     int page = 0, scroll = 0;
+    /* A wheel notch is a small nudge, so a whole page only turns after a few
+       of them; width-fitted pages just scroll by lines instead. */
+    const int WHEEL_PER_PAGE = 3;
+    int wheel = 0;
     Fit fit = FIT_PAGE;
     StateLine saved;
     if (state_lookup(path, &saved)) {
@@ -1815,13 +1838,26 @@ static int read_pdf(const char *path) {
 
         switch (ev.code) {
             case KEY_RIGHT: case KEY_SPACE: case KEY_PAGE_DOWN:
-            case KEY_MOUSE_WHEEL_DOWN:
                 if (fit == FIT_WIDTH && fwd > scroll) scroll = fwd;
                 else if (page < npages - 1) { page++; scroll = 0; }
                 break;
-            case KEY_LEFT: case KEY_PAGE_UP: case KEY_MOUSE_WHEEL_UP:
+            case KEY_LEFT: case KEY_PAGE_UP:
                 if (fit == FIT_WIDTH && scroll > 0 && back < scroll) scroll = back;
                 else if (page > 0) { page--; scroll = SCROLL_END; }
+                break;
+            case KEY_MOUSE_WHEEL_DOWN:
+                if (fit == FIT_WIDTH) scroll += 3 * line;
+                else if (++wheel >= WHEEL_PER_PAGE) {
+                    wheel = 0;
+                    if (page < npages - 1) page++;
+                }
+                break;
+            case KEY_MOUSE_WHEEL_UP:
+                if (fit == FIT_WIDTH) scroll -= 3 * line;
+                else if (--wheel <= -WHEEL_PER_PAGE) {
+                    wheel = 0;
+                    if (page > 0) page--;
+                }
                 break;
             case KEY_DOWN:
                 if (fit == FIT_WIDTH) scroll += line;
@@ -1901,50 +1937,89 @@ static int read_pdf(const char *path) {
     return 0;
 }
 
+/* ----------------------------------------------------------- read comic -- */
+
+static int read_comic(char **paths, int npaths, const ComicOpts *o) {
+    if (!g_graphics) { ui_graphics_error("comics"); return 1; }
+
+    Screen scr;
+    if (!ui_start(&scr)) return 1;
+    ui_cell_size();
+    int rc = comic_read(paths, npaths, o, &g_tm, &scr);
+    ui_stop(&scr);
+    return rc;
+}
+
 /* ----------------------------------------------------------------- main -- */
 
 int main(int argc, char **argv) {
     const char *file = NULL;
+    char **files = NULL;
+    int    nfiles = 0;
+    ComicOpts comic = {0};
     bool want_dump = false, want_resume = false;
     /* Typeset unless the terminal cannot show it or the reader says otherwise;
        --typeset then means insist, and say why when it cannot be had. */
     bool want_text = false, insist_type = false;
     int  width = 76;
 
+    /* Paths are collected rather than taken one at a time: ] and [ move
+       between the comics named on the command line. The other readers take
+       one book, and use the first. */
+    files = calloc((size_t)argc, sizeof *files);
+    if (!files) return 1;
+
     for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
+        char *a = argv[i];
         if (!strcmp(a, "--dump") || !strcmp(a, "-d")) want_dump = true;
         else if (!strcmp(a, "--resume")) want_resume = true;
         else if (!strcmp(a, "--typeset")) insist_type = true;
         else if (!strcmp(a, "--text") || !strcmp(a, "-t")) want_text = true;
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
-        else if (!strcmp(a, "-w") && i + 1 < argc) width = atoi(argv[++i]);
-        else if (a[0] != '-') file = a;
+        else if (!strcmp(a, "-f")) { comic.panel_mode = true; comic.forced = true; }
+        /* -w is the text column width when a number follows it, and otherwise
+           the comic reader's fit-width. The two never apply to one file. */
+        else if (!strcmp(a, "-w") && i + 1 < argc && isdigit((unsigned char)argv[i + 1][0]))
+            width = atoi(argv[++i]);
+        else if (!strcmp(a, "-w")) { comic.fit_width = true; comic.forced = true; }
+        else if (a[0] != '-') files[nfiles++] = a;
         else { usage(); return 2; }
     }
+    file = nfiles ? files[0] : NULL;
 
     /* Not for --dump, whose output is the stdout the probe would write to. */
     if (!want_dump) ui_detect();
+    comic_import_state();
 
-    char picked[PATH_MAX];
+    static char picked[PATH_MAX];
     if (want_resume && !file) {
         int rc = resume_pick(picked, sizeof picked);
         if (rc < 0) { fprintf(stderr, "ep: nothing to resume yet - read a book first\n"); return 1; }
         if (rc > 0) return 0;                       /* cancelled */
+        files[0] = picked;
+        nfiles = 1;
         file = picked;
     }
     if (!file) { usage(); return 2; }
 
+    /* A directory holding page images is a comic and opens as one; anything
+       else is a shelf to look inside. */
     struct stat st;
-    if (stat(file, &st) == 0 && S_ISDIR(st.st_mode)) {
-        PickDir opts = { .accept = book_accept };
+    if (nfiles == 1 && stat(file, &st) == 0 && S_ISDIR(st.st_mode) &&
+        !(comic_dir_is_book(file) && !comic_dir_is_shelf(file))) {
+        PickDir opts = { .accept = book_accept, .leaf = book_leaf };
         if (pick_dir(file, picked, sizeof picked, &opts) != 0) return 0;
+        files[0] = picked;
         file = picked;
     }
 
     char full[PATH_MAX];
     if (!realpath(file, full)) snprintf(full, sizeof full, "%s", file);
 
+    if (comic_is_file(full) || (stat(full, &st) == 0 && S_ISDIR(st.st_mode))) {
+        if (want_dump) { fprintf(stderr, "ep: --dump only works on epubs\n"); return 2; }
+        return read_comic(files, nfiles, &comic);
+    }
     if (is_pdf(full)) {
         if (want_dump) { fprintf(stderr, "ep: --dump only works on epubs\n"); return 2; }
         return read_pdf(full);

@@ -124,7 +124,8 @@ bool term_color_is_light(uint8_t r, uint8_t g, uint8_t b);
 
 #endif
 
-#ifdef TERM_IMPLEMENTATION
+#if defined(TERM_IMPLEMENTATION) && !defined(TERM_IMPLEMENTED)
+#define TERM_IMPLEMENTED
 
 #include <stdio.h>
 #include <stdint.h>

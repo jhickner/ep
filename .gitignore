@@ -2,3 +2,5 @@ ep
 tools/pdfshot
 *.o
 tools/typeshot
+tools/paneltest
+*.ppm

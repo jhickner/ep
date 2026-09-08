@@ -90,7 +90,8 @@ Glyph glyph_dim(Glyph g, float factor);
 
 #endif
 
-#ifdef SCREEN_IMPLEMENTATION
+#if defined(SCREEN_IMPLEMENTATION) && !defined(SCREEN_IMPLEMENTED)
+#define SCREEN_IMPLEMENTED
 
 #include <stdlib.h>
 #include <string.h>
