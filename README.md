@@ -51,8 +51,8 @@ macOS too, which is how it gets tested.
 
 ## epub
 
-Typeset into pages with CoreText: drop caps, small caps, hyphenation and
-justification. `--text` wraps onto the character grid instead.
+Uses kitty graphics and CoreText to render by default: drop caps, small caps, hyphenation and
+justification. Press `d` or use `--text` for text mode.
 
 ![a chapter opening](doc/epub.png)
 
@@ -62,7 +62,7 @@ justification. `--text` wraps onto the character grid instead.
 
 ## comics
 
-`.cbr`, `.cbz`, `.cb7`, `.cbt`, or a directory of page images. `f` walks the
-page a panel at a time; `tab` opens a thumbnail grid.
+`.cbr`, `.cbz`, `.cb7`, `.cbt`, or a directory of page images. `f` toggles
+panel mode. `tab` opens a thumbnail grid.
 
 ![a comic page](doc/comic.jpg)
