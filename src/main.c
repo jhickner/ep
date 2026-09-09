@@ -1074,6 +1074,7 @@ typedef struct {
     uint8_t      term_fg[3];
 
     int          spine, page, npages;
+    int          anchor_block, anchor_off;
     int          cols, rows, w, h;
 } Ty;
 
@@ -1169,6 +1170,8 @@ static void ty_build(Ty *t, int block, int off) {
     t->tc = type_open(&t->doc, &t->st);
     t->npages = t->w > 0 && t->h > 0 ? type_paginate(t->tc, t->w, t->h) : 0;
     t->page   = t->npages ? type_page_of(t->tc, block, off) : 0;
+    t->anchor_block = block;
+    t->anchor_off   = off;
 }
 
 static void ty_chapter(Ty *t, int spine, int block, int off, int dir) {
@@ -1185,9 +1188,14 @@ static void ty_chapter(Ty *t, int spine, int block, int off, int dir) {
 }
 
 static void ty_here(const Ty *t, int *block, int *off) {
-    *block = 0;
-    *off   = 0;
-    if (t->npages > 0) type_page_start(t->tc, t->page, block, off);
+    *block = t->anchor_block;
+    *off   = t->anchor_off;
+}
+
+static void ty_mark(Ty *t) {
+    t->anchor_block = 0;
+    t->anchor_off   = 0;
+    if (t->npages > 0) type_page_start(t->tc, t->page, &t->anchor_block, &t->anchor_off);
 }
 
 static void ty_restyle(Ty *t) {
@@ -1363,14 +1371,14 @@ static int read_typeset(const char *path) {
             continue;
         }
 
-        bool fwd = false, back = false;
+        bool fwd = false, back = false, moved = false;
         switch (ev.code) {
             case KEY_RIGHT: case KEY_SPACE: case KEY_PAGE_DOWN:
             case KEY_DOWN:  case KEY_MOUSE_WHEEL_DOWN: fwd = true; break;
             case KEY_LEFT:  case KEY_PAGE_UP:
             case KEY_UP:    case KEY_MOUSE_WHEEL_UP:   back = true; break;
-            case KEY_HOME:  t.page = 0; dirty = true; break;
-            case KEY_END:   t.page = t.npages ? t.npages - 1 : 0; dirty = true; break;
+            case KEY_HOME:  t.page = 0; dirty = moved = true; break;
+            case KEY_END:   t.page = t.npages ? t.npages - 1 : 0; dirty = moved = true; break;
             case KEY_CHAR:
                 switch (ev.ch) {
                     case 'q': running = false; break;
@@ -1378,8 +1386,8 @@ static int read_typeset(const char *path) {
                     case 's': t.footer = !t.footer; dirty = true; break;
                     case 'f': case 'j': fwd = true; break;
                     case 'b': case 'k': back = true; break;
-                    case 'g': t.page = 0; dirty = true; break;
-                    case 'G': t.page = t.npages ? t.npages - 1 : 0; dirty = true; break;
+                    case 'g': t.page = 0; dirty = moved = true; break;
+                    case 'G': t.page = t.npages ? t.npages - 1 : 0; dirty = moved = true; break;
                     case 'n': case ']':
                         if (t.spine < bk.nspine - 1) {
                             ty_chapter(&t, t.spine + 1, 0, 0, +1);
@@ -1440,20 +1448,22 @@ static int read_typeset(const char *path) {
         }
 
         if (fwd) {
-            if (t.page + 1 < t.npages) { t.page++; dirty = true; }
+            if (t.page + 1 < t.npages) { t.page++; dirty = moved = true; }
             else if (t.spine < bk.nspine - 1) {
                 ty_chapter(&t, t.spine + 1, 0, 0, +1);
-                dirty = true;
+                dirty = moved = true;
             }
         } else if (back) {
-            if (t.page > 0) { t.page--; dirty = true; }
+            if (t.page > 0) { t.page--; dirty = moved = true; }
             else if (t.spine > 0) {
 
                 ty_chapter(&t, t.spine - 1, 0, 0, -1);
                 t.page = t.npages ? t.npages - 1 : 0;
-                dirty = true;
+                dirty = moved = true;
             }
         }
+
+        if (moved) ty_mark(&t);
     }
 
     int b, o;
