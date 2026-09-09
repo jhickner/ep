@@ -1067,7 +1067,6 @@ typedef struct {
     char         initials[PATH_MAX];
     bool         paper;
     bool         footer;
-    bool         fill;
 
     bool         bg_known, fg_known;
     bool         bg_light;
@@ -1098,7 +1097,6 @@ static void ty_conf_load(Ty *t) {
         *sp++ = 0;
         if (!strcmp(line, "size") && atof(sp) >= 6) t->st.size = atof(sp);
         else if (!strcmp(line, "paper")) t->paper = atoi(sp) != 0;
-        else if (!strcmp(line, "fill")) t->fill = atoi(sp) != 0;
         else if (!strcmp(line, "justify")) t->st.justify = atoi(sp) != 0;
         else if (!strcmp(line, "hyphenate")) t->st.hyphenation = atoi(sp) ? 1 : 0;
         else if (!strcmp(line, "dropcap")) t->st.dropcap = atoi(sp) != 0;
@@ -1119,10 +1117,10 @@ static void ty_conf_save(const Ty *t) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "size %.1f\nleading %.2f\nmeasure %.0f\ncolumns %d\npaper %d\n"
-               "fill %d\njustify %d\nhyphenate %d\ndropcap %d\nsmallcaps %d\n"
+               "justify %d\nhyphenate %d\ndropcap %d\nsmallcaps %d\n"
                "footer %d\n",
             t->st.size, t->st.leading, t->st.measure, t->st.columns, t->paper,
-            t->fill, t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
+            t->st.justify, t->st.hyphenation > 0 ? 1 : 0,
             t->st.dropcap, t->st.smallcaps, t->footer);
     fclose(f);
 }
@@ -1211,12 +1209,14 @@ static void draw_ty_status(Screen *s, const Ty *t) {
 
     char right[200];
     char cols[16];
-    if (t->st.columns > 0) snprintf(cols, sizeof cols, "%dcol", t->st.columns);
-    else                   snprintf(cols, sizeof cols, "auto");
-    snprintf(right, sizeof right, "%s %.0f/%.2f %s %s %s   %d/%d   ch %d/%d   ? help",
+    int got = type_columns(t->tc);
+    if (t->st.columns > 0 && got > 0 && got != t->st.columns)
+        snprintf(cols, sizeof cols, "%dcol\xe2\x86\x92%d", t->st.columns, got);
+    else if (t->st.columns > 0) snprintf(cols, sizeof cols, "%dcol", t->st.columns);
+    else                        snprintf(cols, sizeof cols, "auto %d", got);
+    snprintf(right, sizeof right, "%s %.0f/%.2f %s %s   %d/%d   ch %d/%d   ? help",
              t->font, t->st.size, t->st.leading, cols,
              t->st.transparent ? "term" : "paper",
-             t->fill ? "fill" : "page",
              t->npages ? t->page + 1 : 0, t->npages,
              t->spine + 1, t->bk->nspine);
     int rw = (int)strlen(right);
@@ -1233,7 +1233,6 @@ static void draw_ty_help(Screen *s) {
         { "{ }",               "tighter / looser line spacing" },
         { "1 2 3",             "columns; 0 fits what reads well" },
         { "m M",               "narrower / wider column" },
-        { "w",                 "fill the pane" },
         { "d",                 "painted page / terminal colours" },
         { "C",                 "sunk capital" },
         { "J",                 "justified text" },
@@ -1309,9 +1308,12 @@ static int read_typeset(const char *path) {
 
             int rows = box_rows;
             int cols = box_cols;
-            if (!t.fill) {
-                cols = (int)(rows * g_cell_h * 0.68) / g_cell_w;
-                if (cols > box_cols || cols < 8) cols = box_cols;
+            if (t.st.columns > 0 && t.st.measure > 0) {
+                double want = t.st.columns * t.st.measure * t.st.size
+                            + (t.st.columns - 1) * t.st.size * 2.2
+                            + 2 * t.st.size * 2.6;
+                int need = (int)((want + g_cell_w - 1) / g_cell_w);
+                if (need >= 8 && need < box_cols) cols = need;
             }
             int w = cols * g_cell_w, h = rows * g_cell_h;
 
@@ -1433,7 +1435,6 @@ static int read_typeset(const char *path) {
                             dirty = true;
                         }
                         break;
-                    case 'w': t.fill = !t.fill; dirty = true; break;
                     case 'J': t.st.justify = !t.st.justify; ty_restyle(&t); dirty = true; break;
                     case 'H':
                         t.st.hyphenation = t.st.hyphenation > 0 ? 0 : 1;

@@ -38,6 +38,7 @@ void         type_close(TypeChapter *tc);
 
 int  type_paginate(TypeChapter *tc, int w, int h);
 int  type_pages(const TypeChapter *tc);
+int  type_columns(const TypeChapter *tc);
 
 bool type_draw(TypeChapter *tc, int page, uint8_t *rgba);
 
@@ -576,6 +577,8 @@ void type_close(TypeChapter *tc) {
 
 int type_pages(const TypeChapter *tc) { return tc ? tc->npages : 0; }
 
+int type_columns(const TypeChapter *tc) { return tc ? tc->ncols : 0; }
+
 static int para_at(const TypeChapter *tc, CFIndex pos) {
     for (int i = 0; i < tc->paras.n; i++)
         if (pos < tc->paras.v[i].end) return i;
@@ -947,6 +950,7 @@ TypeChapter *type_open(const Doc *d, const TypeStyle *st) { (void)d; (void)st; r
 void type_close(TypeChapter *tc) { (void)tc; }
 int  type_paginate(TypeChapter *tc, int w, int h) { (void)tc; (void)w; (void)h; return 0; }
 int  type_pages(const TypeChapter *tc) { (void)tc; return 0; }
+int  type_columns(const TypeChapter *tc) { (void)tc; return 0; }
 bool type_draw(TypeChapter *tc, int page, uint8_t *rgba) {
     (void)tc; (void)page; (void)rgba; return false;
 }
